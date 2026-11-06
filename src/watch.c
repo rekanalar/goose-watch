@@ -66,6 +66,18 @@ typedef struct { const uint8_t *data; int64_t len; } watch_slice;
 #define MAX_DIRS 512
 #define MAX_FILES 1024
 
+// The time of a file in nanoseconds. The name of the field of the
+// time is not the same on every system.
+#if defined(__APPLE__)
+#define ST_MTIME_NS(st) \
+    ((long long)(st).st_mtimespec.tv_sec * 1000000000LL + \
+     (long long)(st).st_mtimespec.tv_nsec)
+#else
+#define ST_MTIME_NS(st) \
+    ((long long)(st).st_mtim.tv_sec * 1000000000LL + \
+     (long long)(st).st_mtim.tv_nsec)
+#endif
+
 // One watched directory, for the inotify watcher.
 typedef struct {
     int wd;
@@ -189,7 +201,7 @@ static int cmp_files(watcher_t *w, char *out_path, int64_t out_cap) {
             if (S_ISDIR(st.st_mode)) continue;
             if (nfresh >= MAX_FILES) continue;
             snprintf(fresh[nfresh].path, MAX_PATH, "%s", full);
-            fresh[nfresh].mtime = (long long)st.st_mtime;
+            fresh[nfresh].mtime = ST_MTIME_NS(st);
             fresh[nfresh].size = (long long)st.st_size;
             nfresh += 1;
         }
