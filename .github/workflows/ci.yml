@@ -25,20 +25,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install the latest Goose release
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Install the Goose release
         run: |
           set -euo pipefail
           dest="$RUNNER_TEMP/goose"
           mkdir -p "$dest"
-          tag=$(gh release view -R aardappel/goose --json tagName -q .tagName)
+          tag=v2026.3
           case "$RUNNER_OS" in
             Linux) asset="linux-x64.tar.gz" ;;
             macOS) asset="macos-arm64.tar.gz" ;;
           esac
-          gh release download "$tag" -R aardappel/goose -p "*-$asset" -D "$dest" --clobber
-          tar -xzf "$dest"/*-"$asset" -C "$dest"
+          url="https://github.com/aardappel/goose/releases/download/${tag}/goose-${tag}-${asset}"
+          curl -fsSL "$url" -o "$dest/goose.tar.gz"
+          tar -xzf "$dest/goose.tar.gz" -C "$dest"
           exe=$(find "$dest" -type f -name goose | head -1)
           chmod +x "$exe"
           echo "$(dirname "$exe")" >> "$GITHUB_PATH"
