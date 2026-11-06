@@ -253,7 +253,9 @@ static int cmp_files(watcher_t *w, char *out_path, int64_t out_cap) {
 }
 #endif
 
-// The inotify watcher.
+// The inotify watcher. It is only on Linux, because the calls of
+// inotify do not exist on the other systems.
+#if WATCH_HAS_INOTIFY
 
 // add_watch puts a watch on the directory and remembers the path.
 static int add_watch(watcher_t *w, const char *dir) {
@@ -320,6 +322,8 @@ static int read_inotify(watcher_t *w, int timeout_ms, char *out_path,
     w->pending_at = w->pending_len;
     return EV_NONE;
 }
+
+#endif
 
 // watch_backend gives the name of the watcher of the system: "inotify"
 // or "compare".
