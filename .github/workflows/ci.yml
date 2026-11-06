@@ -42,7 +42,7 @@ jobs:
           exe=$(find "$dest" -type f -name goose | head -1)
           chmod +x "$exe"
           echo "$(dirname "$exe")" >> "$GITHUB_PATH"
-          goose --version
+          goose --help | head -3
 
       - name: Check the entry file
         run: goose check watch.goose
