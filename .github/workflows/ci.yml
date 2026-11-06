@@ -50,7 +50,7 @@ jobs:
       - name: Run the test suite
         run: |
           set -o pipefail
-          goose run test/run.goose 2>&1 | tee test-output.txt
+          timeout 300 goose run test/run.goose 2>&1 | tee test-output.txt
         env:
           GOOSE_HOME: ${{ runner.temp }}/goose-home
 
