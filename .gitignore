@@ -5,3 +5,7 @@
 *.a
 /build/
 /out/
+
+# The directories that the test suite makes
+/goose-watch-test-*
+/goose-watch-example-*
