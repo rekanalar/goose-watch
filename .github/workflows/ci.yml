@@ -48,6 +48,14 @@ jobs:
           GOOSE_HOME: ${{ runner.temp }}/goose-home
 
       - name: Run the test suite
-        run: goose run test/run.goose
+        run: |
+          set -o pipefail
+          goose run test/run.goose 2>&1 | tee test-output.txt
         env:
           GOOSE_HOME: ${{ runner.temp }}/goose-home
+
+      - name: Report the failure
+        if: failure()
+        run: |
+          text=$(tail -c 2000 test-output.txt 2>/dev/null | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | tr '\n' '%0A')
+          echo "::error title=The tests failed::${text}"
