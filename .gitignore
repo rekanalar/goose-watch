@@ -1,0 +1,7 @@
+# Build output
+*.o
+*.obj
+*.exe
+*.a
+/build/
+/out/
