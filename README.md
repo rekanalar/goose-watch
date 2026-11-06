@@ -18,7 +18,7 @@ path are proven on every system.
 Add this to the root file of the program that uses it:
 
 ```goose
-import watch from "rekanalar/goose-watch@v0.1.0";
+import watch from "rekanalar/goose-watch@v0.1.1";
 ```
 
 ## API
@@ -45,7 +45,7 @@ waits.
 
 ```goose
 import std;
-import watch from "rekanalar/goose-watch@v0.1.0";
+import watch from "rekanalar/goose-watch@v0.1.1";
 
 fn main() {
     var got: u8[>..] = [];
