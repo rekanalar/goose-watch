@@ -2,7 +2,7 @@
 
 [![ci](https://github.com/rekanalar/goose-watch/actions/workflows/ci.yml/badge.svg)](https://github.com/rekanalar/goose-watch/actions/workflows/ci.yml)
 
-File watching for the Goose programming language. The package watches a
+File watching for the [Goose](https://github.com/aardappel/goose) programming language. The package watches a
 directory and gives the path and the kind of each change.
 
 The C part of the package uses only libc. On Linux the package uses
