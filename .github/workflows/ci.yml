@@ -20,8 +20,6 @@ jobs:
     defaults:
       run:
         shell: bash
-    env:
-      GOOSE_HOME: ${{ runner.temp }}/goose-home
     steps:
       - uses: actions/checkout@v4
 
@@ -40,11 +38,16 @@ jobs:
           tar -xzf "$dest/goose.tar.gz" -C "$dest"
           exe=$(find "$dest" -type f -name goose | head -1)
           chmod +x "$exe"
+          export PATH="$(dirname "$exe"):$PATH"
           echo "$(dirname "$exe")" >> "$GITHUB_PATH"
           goose --help | head -3
 
       - name: Check the entry file
         run: goose check watch.goose
+        env:
+          GOOSE_HOME: ${{ runner.temp }}/goose-home
 
       - name: Run the test suite
         run: goose run test/run.goose
+        env:
+          GOOSE_HOME: ${{ runner.temp }}/goose-home
