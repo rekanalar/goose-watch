@@ -1,2 +1,0 @@
-c_sources = ["src/watch.c"];
-c_include = ["."];
