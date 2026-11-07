@@ -281,7 +281,22 @@ fn main() {
         deep_file.append(deep[..]);
         deep_file.append("/deep.txt");
         write_file(deep_file[..], "deep");
-        assert(wait_kind(d, watch::KIND_CREATED, 3000, deep_file) == watch::KIND_CREATED);
+        var saw_deep = false;
+        let deadline3 = clock_ns() + 3000000000;
+        while clock_ns() < deadline3 && !saw_deep {
+            var buf: u8[>..] = [];
+            let e, ok = watch::next(d, 200, buf);
+            if !ok { break; }
+            print("evt kind=");
+            print(e.kind);
+            print(" dir=");
+            print(e.is_dir);
+            print(" path=");
+            print(buf);
+            print("\n");
+            if e.kind == watch::KIND_CREATED && ends_with(buf[..], "/deep.txt") { saw_deep = true; }
+        }
+        assert(saw_deep);
         assert(watch::stop(d));
         // The chain of the directories goes away from the deepest up.
         remove_level_dirs(dir[..], 40);

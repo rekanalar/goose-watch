@@ -249,6 +249,11 @@ static void cmp_entries(watcher_t *w, file_entry *fresh, int nfresh) {
         if (known) continue;
         for (int j = 0; j < w->nfiles; j++) {
             if (w->files[j].ino != fresh[i].ino || w->files[j].ino == 0) continue;
+            // A rename keeps the size and the kind. A system that
+            // gives the number of a gone file to a new one breaks one
+            // of the two, so the match needs all of them.
+            if (w->files[j].size != fresh[i].size) continue;
+            if (w->files[j].is_dir != fresh[i].is_dir) continue;
             int still = 0;
             for (int k = 0; k < nfresh; k++) {
                 if (strcmp(fresh[k].path, w->files[j].path) == 0) { still = 1; break; }
