@@ -9,6 +9,7 @@ import os;
 import watch from "..";
 
 extern fn watch_test_symlink(target: const u8[:], link_path: const u8[:]) -> i32;
+extern fn watch_test_chmod(path: const u8[:], mode: i32) -> i32;
 
 // remove_level_dirs removes the chain of the directories named
 // "level". The chain goes from the deepest directory up, because a
@@ -41,6 +42,20 @@ fn wait_kind(w: i32, want: i32, timeout_ms: i32, out_path: u8[>..]&) -> i32 {
             out_path.append(buf[..]);
             return e.kind;
         }
+    }
+    return -1;
+}
+
+// wait_path waits for an event of the kind whose path ends with the
+// text. Other kinds and other paths do not stop the wait. It gives the
+// kind of the event that was found, or -1.
+fn wait_path(w: i32, want: i32, suffix: const u8[:], timeout_ms: i32) -> i32 {
+    let deadline = clock_ns() + (timeout_ms as i64) * 1000000;
+    while clock_ns() < deadline {
+        var buf: u8[>..] = [];
+        let e, ok = watch::next(w, 100, buf);
+        if !ok { return -1; }
+        if e.kind == want && ends_with(buf[..], suffix) { return e.kind; }
     }
     return -1;
 }
@@ -247,13 +262,15 @@ fn main() {
         assert(watch::stop(two));
     }
 
-    // A tree deeper than the limit of 32 is not watched.
+    // A deep tree is watched to its last directory. The walk has no
+    // limit of depth, only a guard against a loop of links.
+    print("sec The tree comes first, so the making o\n");
     {
         // The tree comes first, so the making of it gives no event.
         var deep: u8[>..] = [];
         deep.append(dir[..]);
         var i = 0;
-        while i < 32 {
+        while i < 40 {
             deep.append("/level");
             make_dir(deep[..]);
             i += 1;
@@ -264,8 +281,10 @@ fn main() {
         deep_file.append(deep[..]);
         deep_file.append("/deep.txt");
         write_file(deep_file[..], "deep");
-        assert(no_event(d, watch::KIND_CREATED, 500));
+        assert(wait_kind(d, watch::KIND_CREATED, 3000, deep_file) == watch::KIND_CREATED);
         assert(watch::stop(d));
+        // The chain of the directories goes away from the deepest up.
+        remove_level_dirs(dir[..], 40);
     }
 
     // A renamed file gives one renamed event with the new path and the
@@ -620,6 +639,100 @@ fn main() {
         }
     }
 
+
+    // A directory that appears later is watched by a deep watcher. The
+    // directory gives its own created event, flagged as a directory.
+    // A file in it gives a created event and a modified event.
+    {
+        var root: u8[>..] = [];
+        root.append(dir[..]);
+        root.append("/deeproot");
+        make_dir(root[..]);
+        let d = watch::start(root[..], true);
+        assert(d > 0);
+        var sub: u8[>..] = [];
+        sub.append(root[..]);
+        sub.append("/late");
+        make_dir(sub[..]);
+        var got: u8[>..] = [];
+        assert(wait_kind(d, watch::KIND_CREATED, 3000, got) == watch::KIND_CREATED);
+        assert(ends_with(got[..], "/late"));
+        var late_file: u8[>..] = [];
+        late_file.append(sub[..]);
+        late_file.append("/note.txt");
+        write_file(late_file[..], "late");
+        var got2: u8[>..] = [];
+        assert(wait_kind(d, watch::KIND_CREATED, 3000, got2) == watch::KIND_CREATED);
+        assert(ends_with(got2[..], "/late/note.txt"));
+        write_file(late_file[..], "late two");
+        assert(wait_path(d, watch::KIND_MODIFIED, "/late/note.txt", 3000) == watch::KIND_MODIFIED);
+        assert(watch::stop(d));
+        delete_file(late_file[..]);
+        delete_dir(sub[..]);
+        delete_dir(root[..]);
+    }
+
+    // The flag is_dir tells a directory from a file, on both watchers.
+    {
+        drain(w, 300);
+        var d2: u8[>..] = [];
+        d2.append(dir[..]);
+        d2.append("/flagdir");
+        make_dir(d2[..]);
+        var got: u8[>..] = [];
+        let deadline = clock_ns() + 3000000000;
+        var saw_dir = false;
+        while clock_ns() < deadline && !saw_dir {
+            var buf: u8[>..] = [];
+            let e, ok = watch::next(w, 200, buf);
+            if !ok { break; }
+            if e.kind == watch::KIND_CREATED && ends_with(buf[..], "/flagdir") {
+                assert(e.is_dir);
+                saw_dir = true;
+            }
+        }
+        assert(saw_dir);
+        delete_dir(d2[..]);
+        var seen_delete = false;
+        let deadline2 = clock_ns() + 3000000000;
+        while clock_ns() < deadline2 && !seen_delete {
+            var buf: u8[>..] = [];
+            let e, ok = watch::next(w, 200, buf);
+            if !ok { break; }
+            if e.kind == watch::KIND_DELETED && ends_with(buf[..], "/flagdir") {
+                assert(e.is_dir);
+                seen_delete = true;
+            }
+        }
+        assert(seen_delete);
+        drain(w, 300);
+    }
+
+    // A change of the mode gives attrib. A write gives modified, not
+    // attrib. The comparison watcher sees the mode of the file on the
+    // systems of POSIX. On Windows the mode is the word of the
+    // attributes, and a change of the mode alone is rare, so this
+    // part runs on the systems of POSIX only.
+    {
+        var att: u8[>..] = [];
+        att.append(dir[..]);
+        att.append("/att.txt");
+        write_file(att[..], "x");
+        var got: u8[>..] = [];
+        assert(wait_kind(w, watch::KIND_CREATED, 3000, got) == watch::KIND_CREATED);
+        var bname: u8[>..] = [];
+        if watch::backend(bname) == "inotify" {
+            assert(watch_test_chmod(att[..], 384) == 1);
+            assert(wait_kind(w, watch::KIND_ATTRIB, 3000, got) == watch::KIND_ATTRIB);
+            assert(ends_with(got[..], "/att.txt"));
+            // A write is not an attrib.
+            write_file(att[..], "y");
+            assert(wait_kind(w, watch::KIND_MODIFIED, 3000, got) == watch::KIND_MODIFIED);
+        }
+        delete_file(att[..]);
+        drain(w, 300);
+    }
+
     // A negative timeout does not wait. It gives the kind none at once
     // when no event waits.
     {
@@ -630,6 +743,45 @@ fn main() {
         assert(ok);
         assert(e.kind == watch::KIND_NONE);
         assert(clock_ns() - t0 < 100000000);
+    }
+
+
+    // A group of watchers gives the events of all of them, and a
+    // watcher leaves the group without a fault on the others.
+    {
+        var d3: u8[>..] = [];
+        d3.append(dir[..]);
+        d3.append("/gr1");
+        make_dir(d3[..]);
+        var d4: u8[>..] = [];
+        d4.append(dir[..]);
+        d4.append("/gr2");
+        make_dir(d4[..]);
+        var g = watch::Group { handles: [] };
+        let p1 = watch::group_add(g, d3[..], false);
+        let p2 = watch::group_add(g, d4[..], false);
+        assert(p1 >= 0);
+        assert(p2 >= 0);
+        drain(w, 300);
+        var f3: u8[>..] = [];
+        f3.append(d3[..]);
+        f3.append("/one.txt");
+        write_file(f3[..], "1");
+        var which: i32 = -1;
+        var gp: u8[>..] = [];
+        var gold: u8[>..] = [];
+        let e, ok = watch::group_next(g, 3000, which, gp, gold);
+        assert(ok);
+        assert(e.kind == watch::KIND_CREATED);
+        assert(which == p1);
+        assert(ends_with(gp[..], "/one.txt"));
+        assert(watch::group_remove(g, which));
+        assert(watch::group_next(g, 200, which, gp, gold).kind == watch::KIND_NONE);
+        watch::group_close(g);
+        delete_file(f3[..]);
+        delete_dir(d3[..]);
+        delete_dir(d4[..]);
+        drain(w, 300);
     }
 
     // The close of the watcher.

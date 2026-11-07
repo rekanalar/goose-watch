@@ -21,7 +21,7 @@ every system.
 Add these two lines to the root file of the program that uses it:
 
 ```goose
-import watch from "rekanalar/goose-watch@v0.4.0";
+import watch from "rekanalar/goose-watch@v1.0.0";
 import glob from "rekanalar/goose-glob@v1.1.0";
 ```
 
@@ -45,6 +45,10 @@ and v2026.3 on each.
 | `set_poll_interval(handle, ms)` | set the pause of the comparison watcher, 1 to 60000 ms |
 | `set_follow_symlinks(handle, follow)` | go into linked directories, or not |
 | `stop(handle)` | end the watcher |
+| `group_add(group, path, deep)` | start a watcher and put it in the group |
+| `group_next(group, timeout_ms, which, out_path, out_old)` | the next event of any watcher of the group |
+| `group_remove(group, which)` | end one watcher of the group and take it out |
+| `group_close(group)` | end every watcher of the group |
 | `kind_name(kind)` | give the name of a kind |
 | `backend(out_name)` | give the name of the watcher of the system |
 | `glob_match(pattern, text)` | the match that the filter uses. The text is a whole path. |
@@ -52,7 +56,12 @@ and v2026.3 on each.
 | `allowed(filter, path)` | tell whether the filter lets a path through |
 
 The kinds are `KIND_NONE`, `KIND_CREATED`, `KIND_MODIFIED`,
-`KIND_DELETED` and `KIND_RENAMED`.
+`KIND_DELETED`, `KIND_RENAMED` and `KIND_ATTRIB`.
+
+The event holds the flag `is_dir`. It is true when the path is a
+directory. `KIND_ATTRIB` says that the mode of the path changed and the
+content did not. `chmod` of a file gives it on Linux. The comparison
+watcher gives it when only the mode differs.
 
 The `next` call gives the event and a flag. The path of the event goes
 out in the buffer of the caller. The buffer must outlive the event.
@@ -125,7 +134,7 @@ The paths go on the `store` buffer, which must outlive the events.
 
 ```goose
 import std;
-import watch from "rekanalar/goose-watch@v0.3.0";
+import watch from "rekanalar/goose-watch@v1.0.0";
 import glob from "rekanalar/goose-glob@v1.1.0";
 
 fn main() {
@@ -146,16 +155,18 @@ fn main() {
 
 ## Limits
 
-The program holds 16 open watchers at a time. The tree is at most 32
-levels deep. The package follows no symbolic link into another
-directory, unless the caller calls `set_follow_symlinks`. The package
-does not detect a loop of links. The depth limit and the limit of 512
-directories stop it.
+The package follows no symbolic link into another directory, unless the
+caller calls `set_follow_symlinks`. A loop of links is cut at 64 levels.
+A tree that grows while the walk of the comparison watcher runs may
+confuse one look. The next look fixes it.
 
 On Linux the package sees every change at once, and it tells a rename
-from a removal.
+from a removal. A directory that appears under a deep watcher is
+watched, and its entries give created events. A directory that goes
+leaves the table of the watches. The kernel cannot give its watch
+number to the wrong path.
 
-On the other systems the package looks at the files every 50 ms.
+On the other systems the package looks at the tree every 50 ms.
 `set_poll_interval` changes that pause. It has no effect on the inotify
 watcher.
 
@@ -163,18 +174,43 @@ On Windows the comparison watcher finds a rename by the number of the
 file. A system that does not give the right to make symbolic links has
 no link to follow.
 
-A change that starts and ends between two looks may
-be missed on those systems. A file that changes and keeps its time and
-its size may look unchanged on those systems. The comparison watcher
-finds a rename by the inode. A file that is copied and the original
-removed looks like a removal and a new file.
+A change that starts and ends between two looks may be missed on those
+systems. A file that changes and keeps its time and its size may look
+unchanged on those systems. The comparison watcher finds a rename by
+the inode. A file that is copied while the original is removed looks
+like a removal and a new file.
 
-A directory that is made after the start of a deep watcher on Linux is
-not watched. Turning `set_follow_symlinks` off does not remove the
-watches that it added on Linux.
+The burst merge keeps one event for each path, so it cannot show how
+many times a file changed.
 
-The burst merge keeps one event for each path, so it cannot show how many
-times a file changed.
+## The disagreements with the other languages
+
+The rule of the project is hard. A gap stays in one case. The mature
+libraries of Python, Node, Rust and Go disagree on the behavior, and no
+standard decides it. Four such gaps stay:
+
+- **Open and close of a file.** `watchdog` gives `FileOpenedEvent` and
+  `FileClosedEvent` on Linux. `notify` gives access events on Linux
+  only. `chokidar` and `fsnotify` give none. The package gives none.
+- **The event of the parent of a change.** `watchdog` gives
+  `DirModified` for the directory that holds the changed file. `fsnotify`
+  gives none. `chokidar` does not give it by default. The package gives
+  none.
+- **The count of the events of one burst.** A push backend gives one
+  event per write. A poll backend gives one per look. `fsnotify` does
+  not merge. `chokidar` merges with `awaitWriteFinish`. The package
+  merges in `next_batch`, and the caller picks the merge.
+- **The content compare for a file with the same size and time.**
+  `notify` has an option for it. The others have none. The package does
+  not compare content.
+
+## Changes that break old code
+
+The struct `Event` holds the new field `is_dir`. Code that builds an
+`Event` value must set the field. Code that reads only the old fields
+works.
+
+The constant `KIND_ATTRIB` is new, and the value 5 was unknown before.
 
 ## Test
 
@@ -183,6 +219,7 @@ goose run test/run.goose
 goose run examples/watch.goose
 goose run examples/batch.goose
 goose run examples/filter.goose
+goose run examples/group.goose
 ```
 
 ## License
