@@ -55,6 +55,15 @@ jobs:
         env:
           GOOSE_HOME: ${{ runner.temp }}/goose-home
 
+      - name: Run the test suite with the comparison watcher
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          goose run test/run.goose 2>&1 | tee -a test-output.txt
+        env:
+          GOOSE_HOME: ${{ runner.temp }}/goose-home
+          GOOSE_WATCH_COMPARE: "1"
+
       - name: Report the failure
         if: failure()
         run: |

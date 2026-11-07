@@ -9,6 +9,7 @@
 namespace watch;
 
 import std;
+import os;
 
 // The kinds of an event.
 const KIND_NONE: i32 = 0;
@@ -21,12 +22,29 @@ extern fn watch_open(dir: const u8[:], deep: i32, handle_out: i32&) -> bool;
 extern fn watch_backend(out_name: u8[>..]&) -> bool;
 extern fn watch_close(handle: i32) -> bool;
 extern fn watch_next(handle: i32, timeout_ms: i32, out_path: u8[>..]&) -> i32;
+extern fn watch_old(handle: i32, out_path: u8[>..]&) -> bool;
+extern fn watch_set(handle: i32, key: i32, value: i32) -> bool;
 
-// Event holds one change. The path is a slice over the buffer of the
-// caller.
+// The keys of watch_set.
+const SET_INTERVAL: i32 = 1;
+const SET_FOLLOW: i32 = 2;
+
+// Event holds one change. The paths are slices over the buffers of the
+// caller. For a rename, the path is the new path and old_path is the
+// old path. For every other kind, old_path is empty.
 struct Event {
     kind: i32,
     path: const u8[:],
+    old_path: const u8[:],
+}
+
+// Filter holds two lists of patterns. Each list is a text of patterns
+// with a semicolon between them. An empty include list takes every
+// path. A path that an ignore pattern takes is out, whatever the
+// include list says.
+struct Filter {
+    include: const u8[:],
+    ignore: const u8[:],
 }
 
 // start starts a watcher on the path. The flag asks for the
@@ -49,15 +67,16 @@ fn stop(handle: i32) -> bool {
 
 // next waits for the next change. The timeout is in milliseconds. A
 // timeout of 0 waits with no limit. The path of the change goes out in
-// the buffer of the caller.
+// the buffer of the caller. For a rename, the path is the new path and
+// the old path is lost: use next_event to get it.
 //
 // It gives the event and true. The kind of the event is KIND_NONE when
 // the wait ended with no change.
 fn next(handle: i32, timeout_ms: i32, out_path: u8[>..]&) -> Event, bool {
-    if handle <= 0 { return Event { kind: KIND_NONE, path: "" }, false; }
+    if handle <= 0 { return Event { kind: KIND_NONE, path: "", old_path: "" }, false; }
     let kind = watch_next(handle, timeout_ms, out_path);
-    if kind == KIND_NONE { return Event { kind: KIND_NONE, path: "" }, true; }
-    return Event { kind: kind, path: out_path[..] }, true;
+    if kind == KIND_NONE { return Event { kind: KIND_NONE, path: "", old_path: "" }, true; }
+    return Event { kind: kind, path: out_path[..], old_path: "" }, true;
 }
 
 // backend gives the name of the watcher of the system. It gives
@@ -77,4 +96,182 @@ fn kind_name(kind: i32) -> const u8[:] {
     if kind == KIND_DELETED { return "deleted"; }
     if kind == KIND_RENAMED { return "renamed"; }
     return "none";
+}
+
+// next_event is next with the old path of a rename. The old path goes
+// out in the second buffer. Both buffers must outlive the event.
+fn next_event(handle: i32, timeout_ms: i32, out_path: u8[>..]&, out_old: u8[>..]&) -> Event, bool {
+    let e, ok = next(handle, timeout_ms, out_path);
+    if !ok || e.kind != KIND_RENAMED { return e, ok; }
+    if !watch_old(handle, out_old) { return e, true; }
+    return Event { kind: e.kind, path: e.path, old_path: out_old[..] }, true;
+}
+
+// glob_match tells whether the text fits the pattern. A * takes any
+// run of bytes, a / included, and a ? takes one byte.
+fn glob_match(pattern: const u8[:], text: const u8[:]) -> bool {
+    var p: i64 = 0;
+    var t: i64 = 0;
+    var star: i64 = -1;
+    var mark: i64 = 0;
+    while t < text.len {
+        if p < pattern.len && (pattern[p] == '?' || (pattern[p] == text[t] && pattern[p] != '*')) {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len && pattern[p] == '*' {
+            star = p;
+            mark = t;
+            p += 1;
+        } else if star >= 0 {
+            p = star + 1;
+            mark += 1;
+            t = mark;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len && pattern[p] == '*' { p += 1; }
+    return p == pattern.len;
+}
+
+// base_name gives the part of the path after the last slash.
+fn base_name(path: const u8[:]) -> const u8[:] {
+    var i = path.len;
+    while i > 0 && path[i - 1] != '/' { i -= 1; }
+    return path[i..];
+}
+
+// any_match tells whether one pattern of the list fits the path. A
+// pattern with no slash is tried on the name of the file. A pattern with
+// a slash is tried on the whole path.
+fn any_match(list: const u8[:], path: const u8[:]) -> bool {
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while i <= list.len {
+        if i == list.len || list[i] == ';' {
+            let pat = list[start..i];
+            if pat.len > 0 {
+                var slash = false;
+                for c in pat { if c == '/' { slash = true; } }
+                if slash {
+                    if glob_match(pat, path) { return true; }
+                } else {
+                    if glob_match(pat, base_name(path)) { return true; }
+                }
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+// allowed tells whether the filter lets the path through.
+fn allowed(f: Filter, path: const u8[:]) -> bool {
+    if f.ignore.len > 0 && any_match(f.ignore, path) { return false; }
+    if f.include.len > 0 { return any_match(f.include, path); }
+    return true;
+}
+
+// next_filtered is next_event with a filter. An event that the filter
+// refuses is dropped and the wait goes on. The timeout covers the whole
+// wait, not each event. A rename passes when the new path or the old
+// path passes.
+fn next_filtered(handle: i32, timeout_ms: i32, f: Filter, out_path: u8[>..]&, out_old: u8[>..]&) -> Event, bool {
+    let start = clock_ns();
+    while true {
+        var left: i32 = timeout_ms;
+        if timeout_ms > 0 {
+            let spent = ((clock_ns() - start) / 1000000) as i32;
+            if spent >= timeout_ms { return Event { kind: KIND_NONE, path: "", old_path: "" }, true; }
+            left = timeout_ms - spent;
+        }
+        out_path.clear();
+        out_old.clear();
+        let e, ok = next_event(handle, left, out_path, out_old);
+        if !ok { return e, false; }
+        if e.kind == KIND_NONE { return e, true; }
+        if allowed(f, e.path) || (e.old_path.len > 0 && allowed(f, e.old_path)) { return e, true; }
+        // A negative timeout does not wait, so the loop must end.
+        if timeout_ms < 0 { return Event { kind: KIND_NONE, path: "", old_path: "" }, true; }
+    }
+    return Event { kind: KIND_NONE, path: "", old_path: "" }, true;
+}
+
+// set_poll_interval sets the pause between two looks of the comparison
+// watcher, in milliseconds, from 1 to 60000. The default is 50. The
+// inotify watcher does not poll, so the value has no effect on it. It
+// gives false for a closed watcher or a value out of range.
+fn set_poll_interval(handle: i32, ms: i32) -> bool {
+    if handle <= 0 { return false; }
+    return watch_set(handle, SET_INTERVAL, ms);
+}
+
+// set_follow_symlinks sets the rule for a symbolic link. With true, the
+// watcher goes into a linked directory and sees the linked files. The
+// default is false. A change takes effect at once, and the comparison
+// watcher takes a new look at the tree. It gives false for a closed
+// watcher.
+fn set_follow_symlinks(handle: i32, follow: bool) -> bool {
+    if handle <= 0 { return false; }
+    return watch_set(handle, SET_FOLLOW, if follow { 1 } else { 0 });
+}
+
+// next_batch waits for a first change, then keeps reading until no
+// change comes for quiet_ms. It merges the changes of one path into one
+// event: a create and a modify give a create, a create and a delete give
+// nothing, a delete and a create give a modify, a modify and a delete
+// give a delete. The paths go on the store, and the merged events go on
+// the events list, in the order of their first change. The list is
+// empty when the first wait ended with no change.
+//
+// The timeout is the wait for the first change, as in next. The store
+// must outlive the events.
+fn next_batch(handle: i32, timeout_ms: i32, quiet_ms: i32, f: Filter, store: u8[>..]&, events: Event[>..]&) -> bool {
+    var raw: Event[>..] = [];
+    var keep: u8[>..] = [];
+    var buf: u8[>..] = [];
+    var old: u8[>..] = [];
+    var wait = timeout_ms;
+    while true {
+        buf.clear();
+        old.clear();
+        let e, ok = next_filtered(handle, wait, f, buf, old);
+        if !ok { return false; }
+        if e.kind == KIND_NONE { break; }
+        // The path goes on the store at once, so it outlives the buffer.
+        let a = store.len;
+        store.append(e.path);
+        let b = store.len;
+        store.append(e.old_path);
+        let c = store.len;
+        merge_event(raw, e.kind, store[a..b], store[b..c]);
+        wait = if quiet_ms > 0 { quiet_ms } else { -1 };
+    }
+    for r in raw {
+        if r.kind != KIND_NONE { events.push(r); }
+    }
+    return true;
+}
+
+// merge_event puts one change into the list, and joins it with an
+// earlier change of the same path.
+fn merge_event(raw: Event[>..]&, kind: i32, path: const u8[:], old_path: const u8[:]) {
+    if kind != KIND_RENAMED {
+        var i: i64 = 0;
+        while i < raw.len {
+            if raw[i].kind != KIND_NONE && raw[i].kind != KIND_RENAMED && raw[i].path == path {
+                let before = raw[i].kind;
+                var now = kind;
+                if before == KIND_CREATED && kind == KIND_MODIFIED { now = KIND_CREATED; }
+                else if before == KIND_CREATED && kind == KIND_DELETED { now = KIND_NONE; }
+                else if before == KIND_DELETED && kind == KIND_CREATED { now = KIND_MODIFIED; }
+                else if before == KIND_MODIFIED && kind == KIND_MODIFIED { now = KIND_MODIFIED; }
+                raw[i] = Event { kind: now, path: raw[i].path, old_path: "" };
+                return;
+            }
+            i += 1;
+        }
+    }
+    raw.push(Event { kind: kind, path: path, old_path: old_path });
 }

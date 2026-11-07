@@ -7,6 +7,8 @@ import std;
 import os;
 import watch from "..";
 
+extern fn watch_test_symlink(target: const u8[:], link_path: const u8[:]) -> bool;
+
 // remove_level_dirs removes the chain of the directories named
 // "level". The chain goes from the deepest directory up, because a
 // directory can only go when it is empty.
@@ -70,6 +72,28 @@ fn wait_two(w: i32, kind_a: i32, kind_b: i32, timeout_ms: i32) -> bool {
         if seen_a && seen_b { return true; }
     }
     return seen_a && seen_b;
+}
+
+// wait_rename waits for a renamed event and gives its two paths.
+fn wait_rename(w: i32, timeout_ms: i32, out_path: u8[>..]&, out_old: u8[>..]&) -> bool {
+    let deadline = clock_ns() + (timeout_ms as i64) * 1000000;
+    while clock_ns() < deadline {
+        var buf: u8[>..] = [];
+        var old: u8[>..] = [];
+        let e, ok = watch::next_event(w, 100, buf, old);
+        if !ok { return false; }
+        if e.kind == watch::KIND_RENAMED {
+            out_path.append(e.path);
+            out_old.append(e.old_path);
+            return true;
+        }
+    }
+    return false;
+}
+
+// base_of gives the part of the path after the last slash.
+fn base_of(path: const u8[:]) -> const u8[:] {
+    return watch::base_name(path);
 }
 
 // drain waits until no event waits.
@@ -231,12 +255,9 @@ fn main() {
         assert(watch::stop(d));
     }
 
-    // A renamed file gives renamed on the inotify watcher. The
-    // comparison watcher cannot tell a rename from a removal and a new
-    // file, so it gives removed and then created.
+    // A renamed file gives one renamed event with the new path and the
+    // old path, on both watchers.
     {
-        var name_buf: u8[>..] = [];
-        let backend = watch::backend(name_buf);
         var from: u8[>..] = [];
         from.append(dir[..]);
         from.append("/before.txt");
@@ -244,19 +265,256 @@ fn main() {
         // The watcher sees the file first, so it knows the old name.
         var first_got: u8[>..] = [];
         assert(wait_kind(w, watch::KIND_CREATED, 3000, first_got) == watch::KIND_CREATED);
+        drain(w, 300);
         var to: u8[>..] = [];
         to.append(dir[..]);
         to.append("/after.txt");
         rename_file(from[..], to[..]);
-        if backend == "inotify" {
-            var got: u8[>..] = [];
-            assert(wait_kind(w, watch::KIND_RENAMED, 3000, got) == watch::KIND_RENAMED);
-            assert(ends_with(got[..], "/before.txt"));
-        } else {
-            // The comparison watcher gives a removal and a new file.
-            assert(wait_two(w, watch::KIND_DELETED, watch::KIND_CREATED, 3000));
-        }
+        var got: u8[>..] = [];
+        var old: u8[>..] = [];
+        assert(wait_rename(w, 3000, got, old));
+        assert(ends_with(got[..], "/after.txt"));
+        assert(ends_with(old[..], "/before.txt"));
         delete_file(to[..]);
+        drain(w, 300);
+    }
+
+    // A file that moves out of the watched directory gives a removal.
+    {
+        var from: u8[>..] = [];
+        from.append(dir[..]);
+        from.append("/leaving.txt");
+        write_file(from[..], "x");
+        var got: u8[>..] = [];
+        assert(wait_kind(w, watch::KIND_CREATED, 3000, got) == watch::KIND_CREATED);
+        drain(w, 300);
+        var to: u8[>..] = [];
+        to.append(dir[..]);
+        to.append("/sub2/leaving.txt");
+        rename_file(from[..], to[..]);
+        var gone: u8[>..] = [];
+        assert(wait_kind(w, watch::KIND_DELETED, 3000, gone) == watch::KIND_DELETED);
+        assert(ends_with(gone[..], "/leaving.txt"));
+        delete_file(to[..]);
+        drain(w, 300);
+    }
+
+    // The glob match.
+    {
+        assert(watch::glob_match("*.txt", "a.txt"));
+        assert(!watch::glob_match("*.txt", "a.txt.bak"));
+        assert(watch::glob_match("a?c", "abc"));
+        assert(!watch::glob_match("a?c", "ac"));
+        assert(watch::glob_match("*", ""));
+        assert(watch::glob_match("a*b*c", "aXXbYYc"));
+        assert(!watch::glob_match("a*b*c", "aXXbYY"));
+        assert(watch::glob_match("src/*.c", "src/x/y.c"));
+        assert(watch::base_name("/a/b/c.txt") == "c.txt");
+        assert(watch::base_name("c.txt") == "c.txt");
+        // A pattern with no slash fits the name, one with a slash fits the path.
+        assert(watch::any_match("*.go;*.txt", "/x/y/a.txt"));
+        assert(!watch::any_match("*.go;*.c", "/x/y/a.txt"));
+        assert(watch::any_match("/x/*", "/x/y/a.txt"));
+        let f = watch::Filter { include: "*.txt", ignore: "tmp*" };
+        assert(watch::allowed(f, "/d/a.txt"));
+        assert(!watch::allowed(f, "/d/a.log"));
+        assert(!watch::allowed(f, "/d/tmp1.txt"));
+        assert(watch::allowed(watch::Filter { .. }, "/d/anything"));
+    }
+
+    // A filter with include patterns drops the other paths.
+    {
+        drain(w, 300);
+        var log: u8[>..] = [];
+        log.append(dir[..]);
+        log.append("/f1.log");
+        var txt: u8[>..] = [];
+        txt.append(dir[..]);
+        txt.append("/f2.txt");
+        write_file(log[..], "1");
+        write_file(txt[..], "2");
+        var got: u8[>..] = [];
+        var old: u8[>..] = [];
+        let e, ok = watch::next_filtered(w, 3000, watch::Filter { include: "*.txt", .. }, got, old);
+        assert(ok);
+        assert(e.kind == watch::KIND_CREATED);
+        assert(ends_with(e.path, "/f2.txt"));
+        drain(w, 300);
+        // An ignore pattern drops its paths. No txt event may come.
+        var more: u8[>..] = [];
+        more.append(dir[..]);
+        more.append("/f3.txt");
+        var more_log: u8[>..] = [];
+        more_log.append(dir[..]);
+        more_log.append("/f4.log");
+        write_file(more[..], "3");
+        write_file(more_log[..], "4");
+        var seen_log = false;
+        let deadline = clock_ns() + 800 * 1000000;
+        while clock_ns() < deadline {
+            var g: u8[>..] = [];
+            var o: u8[>..] = [];
+            let ev, k = watch::next_filtered(w, 100, watch::Filter { ignore: "*.txt", .. }, g, o);
+            assert(k);
+            if ev.kind != watch::KIND_NONE {
+                assert(!ends_with(ev.path, ".txt"));
+                if ends_with(ev.path, "/f4.log") { seen_log = true; }
+            }
+        }
+        assert(seen_log);
+        delete_file(log[..]);
+        delete_file(txt[..]);
+        delete_file(more[..]);
+        delete_file(more_log[..]);
+        drain(w, 300);
+    }
+
+    // A burst merges into one event for each path.
+    {
+        let b = watch::start(dir[..], false);
+        assert(b > 0);
+        var n1: u8[>..] = [];
+        n1.append(dir[..]);
+        n1.append("/n1.txt");
+        var n2: u8[>..] = [];
+        n2.append(dir[..]);
+        n2.append("/n2.txt");
+        var n3: u8[>..] = [];
+        n3.append(dir[..]);
+        n3.append("/n3.txt");
+        write_file(n1[..], "1");
+        write_file(n2[..], "2");
+        write_file(n2[..], "22");
+        write_file(n3[..], "3");
+        delete_file(n3[..]);
+        var store: u8[>..] = [];
+        var events: watch::Event[>..] = [];
+        assert(watch::next_batch(b, 3000, 300, watch::Filter { .. }, store, events));
+        // n1 and n2 each come once as created, and n3 comes not at all.
+        assert(events.len == 2);
+        var saw1 = false;
+        var saw2 = false;
+        for e in events {
+            assert(e.kind == watch::KIND_CREATED);
+            if ends_with(e.path, "/n1.txt") { saw1 = true; }
+            if ends_with(e.path, "/n2.txt") { saw2 = true; }
+        }
+        assert(saw1 && saw2);
+
+        // A delete and a create of one path merge to one modify.
+        delete_file(n1[..]);
+        write_file(n1[..], "now longer");
+        var store2: u8[>..] = [];
+        var events2: watch::Event[>..] = [];
+        assert(watch::next_batch(b, 3000, 300, watch::Filter { .. }, store2, events2));
+        assert(events2.len == 1);
+        assert(events2[0].kind == watch::KIND_MODIFIED);
+        assert(ends_with(events2[0].path, "/n1.txt"));
+
+        // A wait with no change gives an empty list.
+        var store3: u8[>..] = [];
+        var events3: watch::Event[>..] = [];
+        assert(watch::next_batch(b, 200, 100, watch::Filter { .. }, store3, events3));
+        assert(events3.len == 0);
+
+        // The filter works in a batch.
+        write_file(n3[..], "again");
+        delete_file(n2[..]);
+        var store4: u8[>..] = [];
+        var events4: watch::Event[>..] = [];
+        assert(watch::next_batch(b, 3000, 300, watch::Filter { ignore: "n3*", .. }, store4, events4));
+        assert(events4.len == 1);
+        assert(events4[0].kind == watch::KIND_DELETED);
+        assert(ends_with(events4[0].path, "/n2.txt"));
+
+        assert(watch::stop(b));
+        // A batch on a closed watcher gives no event, as next does.
+        var s5: u8[>..] = [];
+        var e5: watch::Event[>..] = [];
+        assert(watch::next_batch(b, 100, 100, watch::Filter { .. }, s5, e5));
+        assert(e5.len == 0);
+        // A batch on a handle that never was open fails.
+        assert(!watch::next_batch(0, 100, 100, watch::Filter { .. }, s5, e5));
+        delete_file(n1[..]);
+        delete_file(n3[..]);
+    }
+
+    // The polling interval has a range, and events still come.
+    {
+        assert(watch::set_poll_interval(w, 20));
+        assert(!watch::set_poll_interval(w, 0));
+        assert(!watch::set_poll_interval(w, -5));
+        assert(!watch::set_poll_interval(w, 60001));
+        assert(watch::set_poll_interval(w, 60000));
+        assert(watch::set_poll_interval(w, 30));
+        assert(!watch::set_poll_interval(0, 30));
+        drain(w, 300);
+        var p: u8[>..] = [];
+        p.append(dir[..]);
+        p.append("/interval.txt");
+        write_file(p[..], "i");
+        var got: u8[>..] = [];
+        assert(wait_kind(w, watch::KIND_CREATED, 3000, got) == watch::KIND_CREATED);
+        delete_file(p[..]);
+        drain(w, 300);
+    }
+
+    // The comparison watcher does not wait longer than the timeout,
+    // whatever the interval is.
+    {
+        var nb: u8[>..] = [];
+        if watch::backend(nb) == "compare" {
+            let s = watch::start(dir[..], false);
+            assert(s > 0);
+            assert(watch::set_poll_interval(s, 5000));
+            let t0 = clock_ns();
+            var got: u8[>..] = [];
+            let e, ok = watch::next(s, 150, got);
+            assert(ok);
+            assert(e.kind == watch::KIND_NONE);
+            assert(clock_ns() - t0 < 400000000);
+            assert(watch::stop(s));
+        }
+    }
+
+    // The rule for a symbolic link. A deep watcher does not go into a
+    // linked directory until the caller says so.
+    {
+        var ext: u8[>..] = [];
+        ext.append(dir[..]);
+        ext.append("-ext");
+        make_dir(ext[..]);
+        var lnk: u8[>..] = [];
+        lnk.append(dir[..]);
+        lnk.append("/lnk");
+        var target: u8[>..] = [];
+        target.append("../");
+        target.append(base_of(ext[..]));
+        assert(watch_test_symlink(target[..], lnk[..]));
+
+        let d = watch::start(dir[..], true);
+        assert(d > 0);
+        var f1: u8[>..] = [];
+        f1.append(ext[..]);
+        f1.append("/f.txt");
+        write_file(f1[..], "1");
+        assert(no_event(d, watch::KIND_CREATED, 500));
+
+        assert(watch::set_follow_symlinks(d, true));
+        var f2: u8[>..] = [];
+        f2.append(ext[..]);
+        f2.append("/g.txt");
+        write_file(f2[..], "2");
+        var got: u8[>..] = [];
+        assert(wait_kind(d, watch::KIND_CREATED, 3000, got) == watch::KIND_CREATED);
+        assert(ends_with(got[..], "/lnk/g.txt"));
+        assert(!watch::set_follow_symlinks(0, true));
+        assert(watch::stop(d));
+        delete_file(f1[..]);
+        delete_file(f2[..]);
+        delete_file(lnk[..]);
+        delete_dir(ext[..]);
+        drain(w, 300);
     }
 
     // A negative timeout does not wait. It gives the kind none at once
