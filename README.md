@@ -5,9 +5,11 @@
 File watching for the [Goose](https://github.com/aardappel/goose) programming language. The package watches a
 directory and gives the path and the kind of each change.
 
-The C part of the package uses only libc. On Linux the package uses
-inotify. On the other systems the package compares the times and the
-sizes of the files. The kinds are the same on every system.
+The C part of the package uses the C library of the system. On Windows
+it uses the wide calls of Windows, so a path may hold any character. On
+Linux the package uses inotify. On macOS and Windows the package
+compares the times and the sizes of the files. The kinds are the same
+on every system.
 
 The environment variable GOOSE_WATCH_COMPARE asks for the comparison
 watcher on every system. The CI runs the test suite twice. One run uses
@@ -19,14 +21,17 @@ every system.
 Add these two lines to the root file of the program that uses it:
 
 ```goose
-import watch from "rekanalar/goose-watch@v0.3.0";
-import glob from "rekanalar/goose-glob@v1.0.1";
+import watch from "rekanalar/goose-watch@v0.4.0";
+import glob from "rekanalar/goose-glob@v1.1.0";
 ```
 
 The filter of the watcher uses the package `goose-glob`. A package that
 needs another package must have that package declared in the root file
 of the program. If the second line is missing, the compiler names the
 line to add.
+
+The CI runs the gate on Linux, macOS and Windows. It uses Goose v2026.4
+and v2026.3 on each.
 
 ## API
 
@@ -121,7 +126,7 @@ The paths go on the `store` buffer, which must outlive the events.
 ```goose
 import std;
 import watch from "rekanalar/goose-watch@v0.3.0";
-import glob from "rekanalar/goose-glob@v1.0.1";
+import glob from "rekanalar/goose-glob@v1.1.0";
 
 fn main() {
     var got: u8[>..] = [];
@@ -153,6 +158,10 @@ from a removal.
 On the other systems the package looks at the files every 50 ms.
 `set_poll_interval` changes that pause. It has no effect on the inotify
 watcher.
+
+On Windows the comparison watcher finds a rename by the number of the
+file. A system that does not give the right to make symbolic links has
+no link to follow.
 
 A change that starts and ends between two looks may
 be missed on those systems. A file that changes and keeps its time and
