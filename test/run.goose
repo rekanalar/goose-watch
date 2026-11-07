@@ -4,11 +4,11 @@
 // The tests check every kind of the event.
 
 import std;
-import glob from "rekanalar/goose-glob@v1.0.1";
+import glob from "rekanalar/goose-glob@v1.1.0";
 import os;
 import watch from "..";
 
-extern fn watch_test_symlink(target: const u8[:], link_path: const u8[:]) -> bool;
+extern fn watch_test_symlink(target: const u8[:], link_path: const u8[:]) -> i32;
 
 // remove_level_dirs removes the chain of the directories named
 // "level". The chain goes from the deepest directory up, because a
@@ -316,7 +316,7 @@ fn main() {
     {
         var text: u8[>..] = [];
         assert(read_file("watch.goose", text));
-        let pin: const u8[:] = "rekanalar/goose-glob@v1.0.1";
+        let pin: const u8[:] = "rekanalar/goose-glob@v1.1.0";
         var found = false;
         var i = 0;
         while i + pin.len <= text.len {
@@ -586,31 +586,38 @@ fn main() {
         var target: u8[>..] = [];
         target.append("../");
         target.append(base_of(ext[..]));
-        assert(watch_test_symlink(target[..], lnk[..]));
+        // The code is 0 when the system does not allow symbolic links.
+        // The test skips then.
+        let made = watch_test_symlink(target[..], lnk[..]);
+        if (made == 0) {
+            print("skip: this system does not make symbolic links\n");
+            delete_dir(ext[..]);
+        } else {
+            assert(made == 1);
+            let d = watch::start(dir[..], true);
+            assert(d > 0);
+            var f1: u8[>..] = [];
+            f1.append(ext[..]);
+            f1.append("/f.txt");
+            write_file(f1[..], "1");
+            assert(no_event(d, watch::KIND_CREATED, 500));
 
-        let d = watch::start(dir[..], true);
-        assert(d > 0);
-        var f1: u8[>..] = [];
-        f1.append(ext[..]);
-        f1.append("/f.txt");
-        write_file(f1[..], "1");
-        assert(no_event(d, watch::KIND_CREATED, 500));
-
-        assert(watch::set_follow_symlinks(d, true));
-        var f2: u8[>..] = [];
-        f2.append(ext[..]);
-        f2.append("/g.txt");
-        write_file(f2[..], "2");
-        var got: u8[>..] = [];
-        assert(wait_kind(d, watch::KIND_CREATED, 3000, got) == watch::KIND_CREATED);
-        assert(ends_with(got[..], "/lnk/g.txt"));
-        assert(!watch::set_follow_symlinks(0, true));
-        assert(watch::stop(d));
-        delete_file(f1[..]);
-        delete_file(f2[..]);
-        delete_file(lnk[..]);
-        delete_dir(ext[..]);
-        drain(w, 300);
+            assert(watch::set_follow_symlinks(d, true));
+            var f2: u8[>..] = [];
+            f2.append(ext[..]);
+            f2.append("/g.txt");
+            write_file(f2[..], "2");
+            var got: u8[>..] = [];
+            assert(wait_kind(d, watch::KIND_CREATED, 3000, got) == watch::KIND_CREATED);
+            assert(ends_with(got[..], "/lnk/g.txt"));
+            assert(!watch::set_follow_symlinks(0, true));
+            assert(watch::stop(d));
+            delete_file(f1[..]);
+            delete_file(f2[..]);
+            delete_file(lnk[..]);
+            delete_dir(ext[..]);
+            drain(w, 300);
+        }
     }
 
     // A negative timeout does not wait. It gives the kind none at once

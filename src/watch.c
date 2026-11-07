@@ -1,7 +1,7 @@
 // The C part of the goose-watch package.
 //
 // It watches a directory and gives the path and the kind of each
-// change. On Linux the package uses inotify. On the other systems the
+// change. On Linux the package uses inotify. On macOS and Windows the
 // package compares the times and the sizes of the files. Both give the
 // same kinds, so the caller does not need to know the system.
 //
@@ -13,16 +13,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <stdint.h>
+#include <limits.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <unistd.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <dirent.h>
-#include <limits.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#endif
 
 #ifdef __linux__
 #include <sys/inotify.h>
@@ -61,24 +64,16 @@ typedef struct { const uint8_t *data; int64_t len; } watch_slice;
 
 #define MAX_WATCHERS 16
 #define MAX_DEPTH 32
+#ifdef _WIN32
+// The header of Windows gives this name another value.
+#undef MAX_PATH
+#endif
 #define MAX_PATH 1024
 #define MAX_EVENTS 4096
 #define MAX_DIRS 512
 #define MAX_FILES 1024
 #define DEFAULT_INTERVAL_MS 50
 #define MAX_INTERVAL_MS 60000
-
-// The time of a file in nanoseconds. The name of the field of the
-// time is not the same on every system.
-#if defined(__APPLE__)
-#define ST_MTIME_NS(st) \
-    ((long long)(st).st_mtimespec.tv_sec * 1000000000LL + \
-     (long long)(st).st_mtimespec.tv_nsec)
-#else
-#define ST_MTIME_NS(st) \
-    ((long long)(st).st_mtim.tv_sec * 1000000000LL + \
-     (long long)(st).st_mtim.tv_nsec)
-#endif
 
 // One watched directory, for the inotify watcher.
 typedef struct {
@@ -131,12 +126,40 @@ static void path_join(char *out, int64_t out_cap, const char *dir,
 }
 
 // is_dir tells whether the path names a directory.
+#ifdef _WIN32
+// win_wide gives the path in the form of Windows. The bytes of the path
+// are UTF-8, as every path of Goose. It gives 0 when the path is not
+// valid UTF-8 or does not fit.
+static int win_wide(const char *path, wchar_t *out, int cap) {
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, out, cap);
+    if (n <= 0) return 0;
+    return n - 1;
+}
+
+// win_utf8 gives the name of Windows in UTF-8. It gives 0 when the name
+// is not valid or does not fit.
+static int win_utf8(const wchar_t *name, char *out, int cap) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, name, -1, out, cap, NULL, NULL);
+    if (n <= 0) return 0;
+    return n - 1;
+}
+
+static int is_dir(const char *path) {
+    wchar_t wide[MAX_PATH];
+    if (!win_wide(path, wide, MAX_PATH)) return 0;
+    DWORD attrs = GetFileAttributesW(wide);
+    if (attrs == INVALID_FILE_ATTRIBUTES) return 0;
+    return (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+#else
 static int is_dir(const char *path) {
     struct stat st;
     if (stat(path, &st) != 0) return 0;
     return S_ISDIR(st.st_mode);
 }
+#endif
 
+#ifndef _WIN32
 // collect_dirs puts the root and, when the flag is set, each
 // subdirectory into the list. It gives the number of directories.
 //
@@ -183,40 +206,19 @@ static int collect_dirs(const char *root, int recursive, int follow,
     }
     return n;
 }
+#endif
 
 #if 1
 // The comparison watcher. It walks the tree and keeps the time and the
 // size of every file.
 
-// cmp_files puts the new list of files next to the old list and gives
-// the first change. It gives EV_NONE when nothing changed.
+// The new list of the files of a walk.
 static file_entry g_fresh[MAX_FILES];
 
-static int cmp_files(watcher_t *w, char *out_path, int64_t out_cap) {
-    file_entry *fresh = g_fresh;
-    int nfresh = 0;
-    char dirs[MAX_DIRS][MAX_PATH];
-    int ndirs = collect_dirs(w->root, w->recursive, w->follow, dirs, MAX_DIRS);
-    for (int i = 0; i < ndirs; i++) {
-        DIR *d = opendir(dirs[i]);
-        if (!d) continue;
-        struct dirent *e;
-        while ((e = readdir(d)) != NULL) {
-            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-            char full[MAX_PATH];
-            path_join(full, MAX_PATH, dirs[i], e->d_name);
-            struct stat st;
-            if ((w->follow ? stat(full, &st) : lstat(full, &st)) != 0) continue;
-            if (S_ISDIR(st.st_mode)) continue;
-            if (nfresh >= MAX_FILES) continue;
-            snprintf(fresh[nfresh].path, MAX_PATH, "%s", full);
-            fresh[nfresh].mtime = ST_MTIME_NS(st);
-            fresh[nfresh].size = (long long)st.st_size;
-            fresh[nfresh].ino = (long long)st.st_ino;
-            nfresh += 1;
-        }
-        closedir(d);
-    }
+// cmp_entries puts the new list of files next to the old list and
+// gives the first change. It gives EV_NONE when nothing changed.
+static int cmp_entries(watcher_t *w, file_entry *fresh, int nfresh,
+                        char *out_path, int64_t out_cap) {
     // A path that is new gives created. The path joins the list of the
     // watcher, so the next walk knows it.
     for (int i = 0; i < nfresh; i++) {
@@ -276,16 +278,170 @@ static int cmp_files(watcher_t *w, char *out_path, int64_t out_cap) {
     return EV_NONE;
 }
 
-// prime fills the list of the files with the files of the tree now. Each
-// call of cmp_files adds one file, so the calls go on until nothing is
-// new.
-static void prime(watcher_t *w) {
-    char first[MAX_PATH];
-    first[0] = 0;
-    w->nfiles = 0;
-    for (int i = 0; i < MAX_FILES; i++) {
-        if (cmp_files(w, first, MAX_PATH) == EV_NONE) break;
+#ifdef _WIN32
+
+// win_time_ns gives the time of a file in nanoseconds since the epoch.
+// The time of Windows counts from 1601.
+static long long win_time_ns(FILETIME ft) {
+    ULARGE_INTEGER u;
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    long long ticks = (long long)u.QuadPart;
+    // The difference between 1601 and 1970 in steps of 100 nanoseconds.
+    return (ticks - 116444736000000000LL) * 100LL;
+}
+
+// win_open opens a path for the reading of its attributes. The flags
+// say whether a symbolic link is followed.
+static HANDLE win_open(const char *path, int follow) {
+    wchar_t wide[MAX_PATH];
+    if (!win_wide(path, wide, MAX_PATH)) return INVALID_HANDLE_VALUE;
+    DWORD flags = FILE_FLAG_BACKUP_SEMANTICS;
+    if (!follow) flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+    return CreateFileW(wide, 0,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                       NULL, OPEN_EXISTING, flags, NULL);
+}
+
+// win_stat gives the attributes, the time, the size and the number of
+// the file of the path. The number stays the same when the file gets
+// another name. A followed link gives the file of the target. It gives
+// 0 when the path cannot be opened.
+static int win_stat(const char *path, int follow, BY_HANDLE_FILE_INFORMATION *info) {
+    HANDLE h = win_open(path, follow);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    int ok = GetFileInformationByHandle(h, info);
+    CloseHandle(h);
+    return ok;
+}
+
+// win_walk puts the files of the tree into the list. It gives the
+// number of files.
+//
+// A symbolic link is a file of its own when the caller does not follow
+// the links. A followed link gives the file of the target.
+//
+// The count of the directories stops the walk. A loop of links gives
+// many paths of the same directory, and the walk ends then.
+static int win_walk(const char *dir, int recursive, int follow, int depth,
+                    int *ndirs, file_entry *fresh, int cap, int n) {
+    if (*ndirs >= MAX_DIRS) return n;
+    *ndirs += 1;
+    char pattern[MAX_PATH];
+    path_join(pattern, MAX_PATH, dir, "*");
+    wchar_t wide[MAX_PATH];
+    if (!win_wide(pattern, wide, MAX_PATH)) return n;
+    WIN32_FIND_DATAW found;
+    HANDLE h = FindFirstFileW(wide, &found);
+    if (h == INVALID_HANDLE_VALUE) return n;
+    do {
+        char name[MAX_PATH];
+        if (!win_utf8(found.cFileName, name, MAX_PATH)) continue;
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+        char full[MAX_PATH];
+        path_join(full, MAX_PATH, dir, name);
+        int isdir = (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        // Only a symbolic link is a link. A mount point and a cloud
+        // file are reparse points of another kind.
+        int islink = (found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 &&
+                     found.dwReserved0 == IO_REPARSE_TAG_SYMLINK;
+        // A plain directory needs no open. The list of the directory
+        // tells that it is one.
+        if (isdir && !islink) {
+            if (recursive && depth + 1 < MAX_DEPTH) {
+                n = win_walk(full, recursive, follow, depth + 1, ndirs, fresh, cap, n);
+            }
+            continue;
+        }
+        BY_HANDLE_FILE_INFORMATION info;
+        if (!win_stat(full, follow, &info)) continue;
+        if (follow) {
+            // A followed link gives the file of the target.
+            isdir = (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        } else {
+            // A link is a file of its own when the caller does not follow it.
+            isdir = 0;
+        }
+        if (isdir) {
+            if (recursive && depth + 1 < MAX_DEPTH) {
+                n = win_walk(full, recursive, follow, depth + 1, ndirs, fresh, cap, n);
+            }
+        } else {
+            if (n >= cap) break;
+            snprintf(fresh[n].path, MAX_PATH, "%s", full);
+            fresh[n].mtime = win_time_ns(info.ftLastWriteTime);
+            fresh[n].size = ((long long)info.nFileSizeHigh << 32) | (long long)info.nFileSizeLow;
+            fresh[n].ino = ((long long)info.nFileIndexHigh << 32) | (long long)info.nFileIndexLow;
+            n += 1;
+        }
+    } while (FindNextFileW(h, &found));
+    FindClose(h);
+    return n;
+}
+
+// scan_files puts the files of the tree of the watcher into the list.
+static int scan_files(watcher_t *w, file_entry *fresh, int cap) {
+    int ndirs = 0;
+    return win_walk(w->root, w->recursive, w->follow, 0, &ndirs, fresh, cap, 0);
+}
+
+#else
+
+// The time of a file in nanoseconds. The name of the field of the
+// time is not the same on every system.
+#if defined(__APPLE__)
+#define ST_MTIME_NS(st) \
+    ((long long)(st).st_mtimespec.tv_sec * 1000000000LL + \
+     (long long)(st).st_mtimespec.tv_nsec)
+#else
+#define ST_MTIME_NS(st) \
+    ((long long)(st).st_mtim.tv_sec * 1000000000LL + \
+     (long long)(st).st_mtim.tv_nsec)
+#endif
+
+// scan_files puts the files of the tree of the watcher into the list.
+static int scan_files(watcher_t *w, file_entry *fresh, int cap) {
+    int nfresh = 0;
+    char dirs[MAX_DIRS][MAX_PATH];
+    int ndirs = collect_dirs(w->root, w->recursive, w->follow, dirs, MAX_DIRS);
+    for (int i = 0; i < ndirs; i++) {
+        DIR *d = opendir(dirs[i]);
+        if (!d) continue;
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+            char full[MAX_PATH];
+            path_join(full, MAX_PATH, dirs[i], e->d_name);
+            struct stat st;
+            if ((w->follow ? stat(full, &st) : lstat(full, &st)) != 0) continue;
+            if (S_ISDIR(st.st_mode)) continue;
+            if (nfresh >= cap) continue;
+            snprintf(fresh[nfresh].path, MAX_PATH, "%s", full);
+            fresh[nfresh].mtime = ST_MTIME_NS(st);
+            fresh[nfresh].size = (long long)st.st_size;
+            fresh[nfresh].ino = (long long)st.st_ino;
+            nfresh += 1;
+        }
+        closedir(d);
     }
+    return nfresh;
+}
+
+#endif
+
+// cmp_files puts the new list of files next to the old list and gives
+// the first change. It gives EV_NONE when nothing changed.
+static int cmp_files(watcher_t *w, char *out_path, int64_t out_cap) {
+    file_entry *fresh = g_fresh;
+    int nfresh = scan_files(w, fresh, MAX_FILES);
+    return cmp_entries(w, fresh, nfresh, out_path, out_cap);
+}
+
+// prime fills the list of the files with the files of the tree now.
+static void prime(watcher_t *w) {
+    int n = scan_files(w, g_fresh, MAX_FILES);
+    if (n > 0) memcpy(w->files, g_fresh, (size_t)n * sizeof(file_entry));
+    w->nfiles = n;
 }
 #endif
 
@@ -530,8 +686,12 @@ int watch_next(int32_t handle, int32_t timeout_ms, gs_rref out_path) {
             // The last pause is as short as the time that is left, so a
             // long interval does not make the call late.
             int64_t pause = (wait > 0 && left < step) ? left : step;
+#ifdef _WIN32
+            Sleep((DWORD)pause);
+#else
             struct pollfd p = { .fd = 0, .events = 0 };
             poll(&p, 1, (int)pause);
+#endif
             left -= pause;
             kind = cmp_files(w, path, MAX_PATH);
         }
@@ -588,13 +748,33 @@ int watch_set(int32_t handle, int32_t key, int32_t value) {
 
 // watch_test_symlink makes a symbolic link. The tests use it, because
 // the standard library has no call for it.
+//
+// It gives 1 when the link is there. It gives 0 when the system does
+// not allow symbolic links. It gives -1 when the call fails.
 int watch_test_symlink(watch_slice target, watch_slice link_path) {
     char a[MAX_PATH], b[MAX_PATH];
-    if (target.len <= 0 || target.len >= MAX_PATH) return 0;
-    if (link_path.len <= 0 || link_path.len >= MAX_PATH) return 0;
+    if (target.len <= 0 || target.len >= MAX_PATH) return -1;
+    if (link_path.len <= 0 || link_path.len >= MAX_PATH) return -1;
     memcpy(a, target.data, (size_t)target.len);
     a[target.len] = 0;
     memcpy(b, link_path.data, (size_t)link_path.len);
     b[link_path.len] = 0;
-    return symlink(a, b) == 0;
+#ifdef _WIN32
+    // Windows gives the right to make a symbolic link to the
+    // administrators and to the systems with developer mode.
+    wchar_t wtarget[MAX_PATH];
+    wchar_t wlink[MAX_PATH];
+    if (!win_wide(a, wtarget, MAX_PATH)) return -1;
+    if (!win_wide(b, wlink, MAX_PATH)) return -1;
+    DWORD flags = SYMBOLIC_LINK_FLAG_DIRECTORY;
+    if (CreateSymbolicLinkW(wlink, wtarget, flags)) return 1;
+    if (GetLastError() == ERROR_INVALID_PARAMETER) {
+        flags |= SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+        if (CreateSymbolicLinkW(wlink, wtarget, flags)) return 1;
+    }
+    return 0;
+#else
+    if (symlink(a, b) == 0) return 1;
+    return -1;
+#endif
 }
