@@ -76,6 +76,13 @@ missed on those systems. A file that changes and keeps its time and its
 size may look unchanged on those systems. A rename on those systems
 gives a removal and a new file, not a rename.
 
+## Test
+
+```bash
+goose run test/run.goose
+goose run examples/watch.goose
+```
+
 ## License
 
 MIT
