@@ -263,14 +263,15 @@ fn main() {
     }
 
     // A deep tree is watched to its last directory. The walk has no
-    // limit of depth, only a guard against a loop of links.
-    print("sec The tree comes first, so the making o\n");
+    // limit of depth of its own, only a guard against a loop of links.
+    // The depth of 25 stays under the limit of 260 bytes that Windows
+    // puts on a path without its long form.
     {
         // The tree comes first, so the making of it gives no event.
         var deep: u8[>..] = [];
         deep.append(dir[..]);
         var i = 0;
-        while i < 40 {
+        while i < 25 {
             deep.append("/level");
             make_dir(deep[..]);
             i += 1;
@@ -281,25 +282,10 @@ fn main() {
         deep_file.append(deep[..]);
         deep_file.append("/deep.txt");
         write_file(deep_file[..], "deep");
-        var saw_deep = false;
-        let deadline3 = clock_ns() + 3000000000;
-        while clock_ns() < deadline3 && !saw_deep {
-            var buf: u8[>..] = [];
-            let e, ok = watch::next(d, 200, buf);
-            if !ok { break; }
-            print("evt kind=");
-            print(e.kind);
-            print(" dir=");
-            print(e.is_dir);
-            print(" path=");
-            print(buf);
-            print("\n");
-            if e.kind == watch::KIND_CREATED && ends_with(buf[..], "/deep.txt") { saw_deep = true; }
-        }
-        assert(saw_deep);
+        assert(wait_kind(d, watch::KIND_CREATED, 3000, deep_file) == watch::KIND_CREATED);
         assert(watch::stop(d));
         // The chain of the directories goes away from the deepest up.
-        remove_level_dirs(dir[..], 40);
+        remove_level_dirs(dir[..], 25);
     }
 
     // A renamed file gives one renamed event with the new path and the
