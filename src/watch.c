@@ -382,27 +382,29 @@ static int win_walk(const char *dir, int recursive, int follow, int depth,
         path_join(full, MAX_PATH, dir, name);
         int islink = (found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 &&
                      found.dwReserved0 == IO_REPARSE_TAG_SYMLINK;
-        int isdir = (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
-                    !islink;
+        // The word of the enumeration says that a link is not a
+        // directory, even when the target is one. The open of the
+        // entry with the rule of the caller gives the truth, and the
+        // walk goes on with that value.
+        int entry_isdir = (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+                          !islink;
+        unsigned int mode = 0;
+        BY_HANDLE_FILE_INFORMATION info;
+        int ok = win_stat(full, follow && islink, &info, &mode, &entry_isdir);
         // The entry itself goes on the list first, so a rename of a
         // directory is one event of the directory.
-        if (n < cap) {
-            BY_HANDLE_FILE_INFORMATION info;
-            unsigned int mode = 0;
-            int entry_isdir = isdir;
-            if (win_stat(full, follow && islink, &info, &mode, &entry_isdir)) {
-                snprintf(fresh[n].path, MAX_PATH, "%s", full);
-                fresh[n].mtime = win_time_ns(info.ftLastWriteTime);
-                fresh[n].size = ((long long)info.nFileSizeHigh << 32) |
-                                (long long)info.nFileSizeLow;
-                fresh[n].ino = ((long long)info.nFileIndexHigh << 32) |
-                               (long long)info.nFileIndexLow;
-                fresh[n].mode = mode;
-                fresh[n].is_dir = entry_isdir;
-                n += 1;
-            }
+        if (ok && n < cap) {
+            snprintf(fresh[n].path, MAX_PATH, "%s", full);
+            fresh[n].mtime = win_time_ns(info.ftLastWriteTime);
+            fresh[n].size = ((long long)info.nFileSizeHigh << 32) |
+                            (long long)info.nFileSizeLow;
+            fresh[n].ino = ((long long)info.nFileIndexHigh << 32) |
+                           (long long)info.nFileIndexLow;
+            fresh[n].mode = mode;
+            fresh[n].is_dir = entry_isdir;
+            n += 1;
         }
-        if (isdir && recursive) {
+        if (ok && entry_isdir && recursive) {
             n = win_walk(full, recursive, follow, depth + 1, seen, nseen,
                          ndirs, fresh, cap, n);
         }
