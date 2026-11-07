@@ -391,6 +391,10 @@ static int win_walk(const char *dir, int recursive, int follow, int depth,
         unsigned int mode = 0;
         BY_HANDLE_FILE_INFORMATION info;
         int ok = win_stat(full, follow && islink, &info, &mode, &entry_isdir);
+        // The open of a not-followed link still reports the bit of a
+        // directory when the target is one. The link itself is a file
+        // entry, as on the systems of POSIX.
+        if (ok && !follow && islink) entry_isdir = 0;
         // The entry itself goes on the list first, so a rename of a
         // directory is one event of the directory.
         if (ok && n < cap) {
