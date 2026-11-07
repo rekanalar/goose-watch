@@ -10,7 +10,7 @@ namespace watch;
 
 import std;
 import os;
-import glob from "rekanalar/goose-glob@v1.0.1";
+import glob from "rekanalar/goose-glob@v1.1.0";
 
 // The kinds of an event.
 const KIND_NONE: i32 = 0;

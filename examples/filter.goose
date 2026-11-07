@@ -6,7 +6,7 @@
 // Run with: goose run examples/filter.goose
 
 import std;
-import glob from "rekanalar/goose-glob@v1.0.1";
+import glob from "rekanalar/goose-glob@v1.1.0";
 import watch from "..";
 
 fn main() {
