@@ -14,7 +14,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        tag: [v2026.3, v2026.4]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     defaults:
@@ -28,19 +29,27 @@ jobs:
           set -euo pipefail
           dest="$RUNNER_TEMP/goose"
           mkdir -p "$dest"
-          tag=v2026.3
+          tag="${{ matrix.tag }}"
           case "$RUNNER_OS" in
             Linux) asset="linux-x64.tar.gz" ;;
             macOS) asset="macos-arm64.tar.gz" ;;
+            Windows) asset="windows-x64.zip" ;;
           esac
           url="https://github.com/aardappel/goose/releases/download/${tag}/goose-${tag}-${asset}"
-          curl -fsSL "$url" -o "$dest/goose.tar.gz"
-          tar -xzf "$dest/goose.tar.gz" -C "$dest"
-          exe=$(find "$dest" -type f -name goose | head -1)
+          if [ "$RUNNER_OS" = Windows ]; then
+            curl -fsSL "$url" -o "$dest/goose.zip"
+            7z x -y -o"$dest" "$dest/goose.zip" > /dev/null
+            exe=$(find "$dest" -type f -name goose.exe | head -1)
+          else
+            curl -fsSL "$url" -o "$dest/goose.tar.gz"
+            tar -xzf "$dest/goose.tar.gz" -C "$dest"
+            exe=$(find "$dest" -type f -name goose | head -1)
+          fi
           chmod +x "$exe"
-          export PATH="$(dirname "$exe"):$PATH"
-          echo "$(dirname "$exe")" >> "$GITHUB_PATH"
-          goose --help | head -3
+          bindir="$(dirname "$exe")"
+          if [ "$RUNNER_OS" = Windows ]; then bindir="$(cygpath -w "$bindir")"; fi
+          echo "$bindir" >> "$GITHUB_PATH"
+          "$exe" --help | head -3
 
       - name: Check the entry file
         run: goose check watch.goose
@@ -63,6 +72,17 @@ jobs:
         env:
           GOOSE_HOME: ${{ runner.temp }}/goose-home
           GOOSE_WATCH_COMPARE: "1"
+
+      - name: Run the examples
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          for f in examples/*.goose; do
+            echo "--- $f"
+            goose run "$f"
+          done
+        env:
+          GOOSE_HOME: ${{ runner.temp }}/goose-home
 
       - name: Report the failure
         if: failure()
