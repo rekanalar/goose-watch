@@ -309,12 +309,8 @@ static HANDLE win_open(const char *path, int follow) {
 // 0 when the path cannot be opened.
 static int win_stat(const char *path, int follow, BY_HANDLE_FILE_INFORMATION *info) {
     HANDLE h = win_open(path, follow);
-    if (h == INVALID_HANDLE_VALUE) {
-        fprintf(stderr, "watch debug: cannot open %s follow %d error %lu\n", path, follow, (unsigned long)GetLastError());
-        return 0;
-    }
+    if (h == INVALID_HANDLE_VALUE) return 0;
     int ok = GetFileInformationByHandle(h, info);
-    if (!ok) fprintf(stderr, "watch debug: cannot read %s follow %d error %lu\n", path, follow, (unsigned long)GetLastError());
     CloseHandle(h);
     return ok;
 }
@@ -345,7 +341,6 @@ static int win_walk(const char *dir, int recursive, int follow, int depth,
         char full[MAX_PATH];
         path_join(full, MAX_PATH, dir, name);
         int isdir = (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-        fprintf(stderr, "watch debug: entry %s attrs %lu tag %lu\n", full, (unsigned long)found.dwFileAttributes, (unsigned long)found.dwReserved0);
         // Only a symbolic link is a link. A mount point and a cloud
         // file are reparse points of another kind.
         int islink = (found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 &&
@@ -359,10 +354,7 @@ static int win_walk(const char *dir, int recursive, int follow, int depth,
             continue;
         }
         BY_HANDLE_FILE_INFORMATION info;
-        if (!win_stat(full, follow, &info)) {
-            fprintf(stderr, "watch debug: skip %s attrs %lu tag %lu\n", full, (unsigned long)found.dwFileAttributes, (unsigned long)found.dwReserved0);
-            continue;
-        }
+        if (!win_stat(full, follow, &info)) continue;
         if (follow) {
             // A followed link gives the file of the target.
             isdir = (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
@@ -770,10 +762,17 @@ int watch_test_symlink(watch_slice target, watch_slice link_path) {
 #ifdef _WIN32
     // Windows gives the right to make a symbolic link to the
     // administrators and to the systems with developer mode.
+    //
+    // The target of a link on Windows holds backslashes. A target with
+    // a slash gives the error ERROR_INVALID_NAME when the link is
+    // opened.
     wchar_t wtarget[MAX_PATH];
     wchar_t wlink[MAX_PATH];
     if (!win_wide(a, wtarget, MAX_PATH)) return -1;
     if (!win_wide(b, wlink, MAX_PATH)) return -1;
+    for (int i = 0; wtarget[i]; i++) {
+        if (wtarget[i] == L'/') wtarget[i] = L'\\';
+    }
     DWORD flags = SYMBOLIC_LINK_FLAG_DIRECTORY;
     if (CreateSymbolicLinkW(wlink, wtarget, flags)) return 1;
     if (GetLastError() == ERROR_INVALID_PARAMETER) {
