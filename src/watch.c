@@ -361,6 +361,7 @@ static int win_stat(const char *path, int follow, BY_HANDLE_FILE_INFORMATION *in
 static int win_walk(const char *dir, int recursive, int follow, int depth,
                     long long *seen, int nseen, int *ndirs,
                     file_entry *fresh, int cap, int n) {
+    fprintf(stderr, "dbgwalk depth=%d dir=%s\n", depth, dir);
     if (*ndirs >= 4096 || depth >= MAX_DEPTH) return n;
     *ndirs += 1;
     long long id = dir_identity(dir);
@@ -391,6 +392,7 @@ static int win_walk(const char *dir, int recursive, int follow, int depth,
             unsigned int mode = 0;
             int entry_isdir = isdir;
             if (win_stat(full, follow && islink, &info, &mode, &entry_isdir)) {
+                fprintf(stderr, "dbgstat %s\n", full);
                 snprintf(fresh[n].path, MAX_PATH, "%s", full);
                 fresh[n].mtime = win_time_ns(info.ftLastWriteTime);
                 fresh[n].size = ((long long)info.nFileSizeHigh << 32) |
