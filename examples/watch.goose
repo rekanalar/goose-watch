@@ -4,6 +4,7 @@
 // prints the event. The directory goes away at the end.
 
 import std;
+import glob from "rekanalar/goose-glob@v1.0.1";
 import os;
 import watch from "..";
 

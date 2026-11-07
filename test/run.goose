@@ -4,6 +4,7 @@
 // The tests check every kind of the event.
 
 import std;
+import glob from "rekanalar/goose-glob@v1.0.1";
 import os;
 import watch from "..";
 
@@ -114,7 +115,19 @@ fn ends_with(text: const u8[:], tail: const u8[:]) -> bool {
     return text[cut..] == tail;
 }
 
+// test_hostile checks a pattern with many ** segments. It must end at once.
+fn test_hostile() {
+    var p: u8[>..] = [];
+    var t: u8[>..] = [];
+    for i in 0..40 { p.append("**/"); }
+    p.append("x");
+    for i in 0..60 { t.append("d/"); }
+    assert(!watch::glob_match(p[..], t[..]));
+    assert(!watch::any_match(p[..], t[..]));
+}
+
 fn main() {
+    test_hostile();
     // The base of the test directory. The name of the test directory is
     // unique, so parallel runs do not collide.
     var dir: u8[>..] = [];
@@ -299,7 +312,60 @@ fn main() {
         drain(w, 300);
     }
 
-    // The glob match.
+    // The import line of the entry file pins the tag of the glob package.
+    {
+        var text: u8[>..] = [];
+        assert(read_file("watch.goose", text));
+        let pin: const u8[:] = "rekanalar/goose-glob@v1.0.1";
+        var found = false;
+        var i = 0;
+        while i + pin.len <= text.len {
+            var same = true;
+            var j = 0;
+            while j < pin.len {
+                if text[i + j] != pin[j] { same = false; break; }
+                j += 1;
+            }
+            if same { found = true; }
+            i += 1;
+        }
+        assert(found);
+    }
+
+    // The filter and the glob package give the same answer. The cases
+    // cover a star of a segment, a star of the segments, a class, a group
+    // of alternatives and an escape byte.
+    {
+        let pats: const u8[:] = "*.txt;a?c;a*b*c;src/*.c;src/**/*.c;log[0-9].txt;log[!0-9].txt;{a,b}.txt;**/*.go;src/**";
+        let texts: const u8[:] = "a.txt;a.txt.bak;abc;ac;aXXbYYc;aXXbYY;src/x.c;src/x/y.c;log7.txt;logx.txt;a.txt;b.txt;c.txt;x/y/a.go;x/y/a.txt";
+        // The list is split at the semicolons. Each pattern is compared
+        // with each text.
+        var pi = 0;
+        var ps = 0;
+        while pi <= pats.len {
+            if pi == pats.len || pats[pi] == ';' {
+                let pat = pats[ps..pi];
+                if pat.len > 0 {
+                    var ti = 0;
+                    var ts = 0;
+                    while ti <= texts.len {
+                        if ti == texts.len || texts[ti] == ';' {
+                            let txt = texts[ts..ti];
+                            if txt.len > 0 {
+                                assert(watch::glob_match(pat, txt) == glob::matches(txt, pat));
+                            }
+                            ts = ti + 1;
+                        }
+                        ti += 1;
+                    }
+                }
+                ps = pi + 1;
+            }
+            pi += 1;
+        }
+    }
+
+    // The glob match. The text is a whole path.
     {
         assert(watch::glob_match("*.txt", "a.txt"));
         assert(!watch::glob_match("*.txt", "a.txt.bak"));
@@ -308,13 +374,43 @@ fn main() {
         assert(watch::glob_match("*", ""));
         assert(watch::glob_match("a*b*c", "aXXbYYc"));
         assert(!watch::glob_match("a*b*c", "aXXbYY"));
-        assert(watch::glob_match("src/*.c", "src/x/y.c"));
+        // A star of a pattern with a separator stops at a separator. The
+        // old code let the star cross it. A caller who wants the whole
+        // tree writes **.
+        assert(watch::glob_match("src/*.c", "src/x.c"));
+        assert(!watch::glob_match("src/*.c", "src/x/y.c"));
+        assert(watch::glob_match("src/**/*.c", "src/x/y.c"));
+        assert(watch::glob_match("src/**/*.c", "src/x.c"));
+        assert(!watch::glob_match("src/**/*.c", "other/x.c"));
+        // A class of characters.
+        assert(watch::glob_match("log[0-9].txt", "log7.txt"));
+        assert(!watch::glob_match("log[0-9].txt", "logx.txt"));
+        assert(watch::glob_match("log[!0-9].txt", "logx.txt"));
+        assert(!watch::glob_match("log[!0-9].txt", "log7.txt"));
+        assert(watch::glob_match("log[abc].txt", "logb.txt"));
+        assert(!watch::glob_match("log[abc].txt", "logd.txt"));
+        // A class that is not closed is a literal.
+        assert(watch::glob_match("log[0-9.txt", "log[0-9.txt"));
+        // A group of alternatives and an escape byte.
+        assert(watch::glob_match("{a,b}.txt", "a.txt"));
+        assert(watch::glob_match("{a,b}.txt", "b.txt"));
+        assert(!watch::glob_match("{a,b}.txt", "c.txt"));
+        assert(watch::glob_match("a\\*b", "a*b"));
         assert(watch::base_name("/a/b/c.txt") == "c.txt");
         assert(watch::base_name("c.txt") == "c.txt");
         // A pattern with no slash fits the name, one with a slash fits the path.
         assert(watch::any_match("*.go;*.txt", "/x/y/a.txt"));
         assert(!watch::any_match("*.go;*.c", "/x/y/a.txt"));
-        assert(watch::any_match("/x/*", "/x/y/a.txt"));
+        // The star of a pattern with a separator stops at it. The old code
+        // let the star cross it.
+        assert(!watch::any_match("/x/*", "/x/y/a.txt"));
+        assert(watch::any_match("/x/*", "/x/a.txt"));
+        assert(watch::any_match("/x/**", "/x/y/a.txt"));
+        // The filter takes the full syntax.
+        assert(watch::any_match("**/*.go", "/x/y/a.go"));
+        assert(!watch::any_match("**/*.go", "/x/y/a.txt"));
+        assert(watch::any_match("log[0-9].txt", "/x/log3.txt"));
+        assert(!watch::any_match("log[0-9].txt", "/x/logx.txt"));
         let f = watch::Filter { include: "*.txt", ignore: "tmp*" };
         assert(watch::allowed(f, "/d/a.txt"));
         assert(!watch::allowed(f, "/d/a.log"));

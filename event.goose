@@ -10,6 +10,7 @@ namespace watch;
 
 import std;
 import os;
+import glob from "rekanalar/goose-glob@v1.0.1";
 
 // The kinds of an event.
 const KIND_NONE: i32 = 0;
@@ -107,31 +108,12 @@ fn next_event(handle: i32, timeout_ms: i32, out_path: u8[>..]&, out_old: u8[>..]
     return Event { kind: e.kind, path: e.path, old_path: out_old[..] }, true;
 }
 
-// glob_match tells whether the text fits the pattern. A * takes any
-// run of bytes, a / included, and a ? takes one byte.
+// glob_match tells whether the text fits the pattern. The text is a whole
+// path. The syntax is the syntax of the glob package: a * stops at a
+// separator, a ** takes any number of segments, and a class of characters
+// takes one byte.
 fn glob_match(pattern: const u8[:], text: const u8[:]) -> bool {
-    var p: i64 = 0;
-    var t: i64 = 0;
-    var star: i64 = -1;
-    var mark: i64 = 0;
-    while t < text.len {
-        if p < pattern.len && (pattern[p] == '?' || (pattern[p] == text[t] && pattern[p] != '*')) {
-            p += 1;
-            t += 1;
-        } else if p < pattern.len && pattern[p] == '*' {
-            star = p;
-            mark = t;
-            p += 1;
-        } else if star >= 0 {
-            p = star + 1;
-            mark += 1;
-            t = mark;
-        } else {
-            return false;
-        }
-    }
-    while p < pattern.len && pattern[p] == '*' { p += 1; }
-    return p == pattern.len;
+    return glob::matches(text, pattern);
 }
 
 // base_name gives the part of the path after the last slash.
@@ -154,9 +136,9 @@ fn any_match(list: const u8[:], path: const u8[:]) -> bool {
                 var slash = false;
                 for c in pat { if c == '/' { slash = true; } }
                 if slash {
-                    if glob_match(pat, path) { return true; }
+                    if glob::matches(path, pat) { return true; }
                 } else {
-                    if glob_match(pat, base_name(path)) { return true; }
+                    if glob::match_name(base_name(path), pat) { return true; }
                 }
             }
             start = i + 1;

@@ -16,11 +16,17 @@ every system.
 
 ## Install
 
-Add this to the root file of the program that uses it:
+Add these two lines to the root file of the program that uses it:
 
 ```goose
-import watch from "rekanalar/goose-watch@v0.2.0";
+import watch from "rekanalar/goose-watch@v0.3.0";
+import glob from "rekanalar/goose-glob@v1.0.1";
 ```
+
+The filter of the watcher uses the package `goose-glob`. A package that
+needs another package must have that package declared in the root file
+of the program. If the second line is missing, the compiler names the
+line to add.
 
 ## API
 
@@ -36,7 +42,8 @@ import watch from "rekanalar/goose-watch@v0.2.0";
 | `stop(handle)` | end the watcher |
 | `kind_name(kind)` | give the name of a kind |
 | `backend(out_name)` | give the name of the watcher of the system |
-| `glob_match(pattern, text)` | the match that the filter uses |
+| `glob_match(pattern, text)` | the match that the filter uses. The text is a whole path. |
+| `any_match(list, path)` | tell whether one pattern of a list fits the path |
 | `allowed(filter, path)` | tell whether the filter lets a path through |
 
 The kinds are `KIND_NONE`, `KIND_CREATED`, `KIND_MODIFIED`,
@@ -68,12 +75,30 @@ Before v0.2.0, the path of a rename was the old path.
 A filter has two lists, `include` and `ignore`. A list is a text of
 patterns with a semicolon between them.
 
-A `*` takes any run of bytes, and a `?` takes one byte. A pattern with
-no slash fits the name of the file. A pattern with a slash fits the
-whole path.
+The pattern is a glob pattern of the package `goose-glob`. The syntax is
+that syntax:
+
+| Pattern | Matches |
+|---|---|
+| `*` | any bytes in one segment |
+| `**` | any number of segments, when it is a whole segment |
+| `?` | one byte |
+| `[abc]` | one byte from the set |
+| `[a-c]` | one byte from the range |
+| `[!abc]` | one byte that is not in the set |
+| `{a,b}` | either alternative |
+| `\x` | the byte x, as a literal |
+
+A pattern with no slash fits the name of the file. A pattern with a
+slash fits the whole path.
 
 An empty `include` takes every path. An `ignore` pattern wins over
 `include`.
+
+Before v0.3.0, the filter had its own matcher. That matcher had no
+`**` and no class of characters. A star crossed a separator, so the
+pattern `src/*.c` fitted the path `src/x/y.c`. It does not fit now.
+Write `src/**/*.c` for that path.
 
 ### Burst merge
 
@@ -95,7 +120,8 @@ The paths go on the `store` buffer, which must outlive the events.
 
 ```goose
 import std;
-import watch from "rekanalar/goose-watch@v0.2.0";
+import watch from "rekanalar/goose-watch@v0.3.0";
+import glob from "rekanalar/goose-glob@v1.0.1";
 
 fn main() {
     var got: u8[>..] = [];
@@ -138,8 +164,8 @@ A directory that is made after the start of a deep watcher on Linux is
 not watched. Turning `set_follow_symlinks` off does not remove the
 watches that it added on Linux.
 
-The filter has no `**` and no character classes. The burst merge keeps
-one event for each path, so it cannot show how many times a file changed.
+The burst merge keeps one event for each path, so it cannot show how many
+times a file changed.
 
 ## Test
 
@@ -147,6 +173,7 @@ one event for each path, so it cannot show how many times a file changed.
 goose run test/run.goose
 goose run examples/watch.goose
 goose run examples/batch.goose
+goose run examples/filter.goose
 ```
 
 ## License

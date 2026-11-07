@@ -5,4 +5,5 @@
 namespace watch;
 
 import std;
+import glob from "rekanalar/goose-glob@v1.0.1";
 import event;
