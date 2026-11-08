@@ -222,6 +222,28 @@ fn main() {
 }
 ```
 
+## Security
+
+The package watches the directories that a caller names. These protections
+go beyond the reference libraries.
+
+- The package follows no symbolic link into another directory, unless the
+  caller calls `set_follow_symlinks`. The option `followSymlinks` of
+  `chokidar` is on by default. A link can take the watcher out of the
+  tree that the caller named. A loop of links is cut at 64 levels.
+- The burst merge keeps one event for each path. A file that changes many
+  times gives one event, so it cannot flood the caller.
+
+These risks stay.
+
+- The package reads the names of the files of a directory that the caller
+  names. A caller that watches a directory with secrets must trust that
+  directory.
+- The comparison watcher reads the content of the files that it watches
+  when the caller turns the compare on. It reads every byte that it may
+  read.
+- The package writes nothing and runs no command.
+
 ## Limits
 
 The package follows no symbolic link into another directory, unless the
