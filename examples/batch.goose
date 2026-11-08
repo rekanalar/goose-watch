@@ -4,7 +4,7 @@
 // as merged events with a filter that drops *.tmp files.
 
 import std;
-import glob from "rekanalar/goose-glob@v1.1.0";
+import glob from "rekanalar/goose-glob@v1.2.0";
 import os;
 import watch from "..";
 

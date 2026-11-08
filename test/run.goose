@@ -4,7 +4,7 @@
 // The tests check every kind of the event.
 
 import std;
-import glob from "rekanalar/goose-glob@v1.1.0";
+import glob from "rekanalar/goose-glob@v1.2.0";
 import os;
 import watch from "..";
 
@@ -336,7 +336,7 @@ fn main() {
     {
         var text: u8[>..] = [];
         assert(read_file("watch.goose", text));
-        let pin: const u8[:] = "rekanalar/goose-glob@v1.1.0";
+        let pin: const u8[:] = "rekanalar/goose-glob@v1.2.0";
         var found = false;
         var i = 0;
         while i + pin.len <= text.len {

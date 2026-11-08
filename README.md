@@ -21,8 +21,8 @@ every system.
 Add these two lines to the root file of the program that uses it:
 
 ```goose
-import watch from "rekanalar/goose-watch@v1.0.0";
-import glob from "rekanalar/goose-glob@v1.1.0";
+import watch from "rekanalar/goose-watch@v1.0.1";
+import glob from "rekanalar/goose-glob@v1.2.0";
 ```
 
 The filter of the watcher uses the package `goose-glob`. A package that
@@ -134,8 +134,8 @@ The paths go on the `store` buffer, which must outlive the events.
 
 ```goose
 import std;
-import watch from "rekanalar/goose-watch@v1.0.0";
-import glob from "rekanalar/goose-glob@v1.1.0";
+import watch from "rekanalar/goose-watch@v1.0.1";
+import glob from "rekanalar/goose-glob@v1.2.0";
 
 fn main() {
     var got: u8[>..] = [];

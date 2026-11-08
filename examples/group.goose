@@ -5,7 +5,7 @@
 // the event, and the kind and the path of the event.
 
 import std;
-import glob from "rekanalar/goose-glob@v1.1.0";
+import glob from "rekanalar/goose-glob@v1.2.0";
 import os;
 import watch from "..";
 
