@@ -9,6 +9,7 @@
 namespace watch;
 
 import std;
+import regex;
 import os;
 import glob from "rekanalar/goose-glob@v1.2.0";
 
@@ -30,10 +31,18 @@ extern fn watch_close(handle: i32) -> bool;
 extern fn watch_next(handle: i32, timeout_ms: i32, out_path: u8[>..]&) -> i32;
 extern fn watch_old(handle: i32, out_path: u8[>..]&) -> bool;
 extern fn watch_set(handle: i32, key: i32, value: i32) -> bool;
+extern fn watch_set_path(handle: i32, key: i32, dir: const u8[:]) -> bool;
+extern fn watch_add_path(dir: const u8[:], handle: i32) -> bool;
+extern fn watch_remove_path(dir: const u8[:], handle: i32) -> bool;
 
 // The keys of watch_set.
 const SET_INTERVAL: i32 = 1;
 const SET_FOLLOW: i32 = 2;
+const SET_COMPARE_CONTENTS: i32 = 3;
+const SET_DEPTH: i32 = 4;
+
+// The keys of watch_set_path.
+const SET_BASE: i32 = 5;
 
 // Event holds one change. The paths are slices over the buffers of the
 // caller. For a rename, the path is the new path and old_path is the
@@ -56,13 +65,18 @@ struct Group {
     handles: i32[>..],
 }
 
-// Filter holds two lists of patterns. Each list is a text of patterns
-// with a semicolon between them. An empty include list takes every
-// path. A path that an ignore pattern takes is out, whatever the
-// include list says.
+// Filter holds three lists. The include and ignore lists are texts of
+// glob patterns with a semicolon between them. The ignore_regexp list
+// is a text of regular expressions with a semicolon between them; the
+// syntax is the syntax of the standard regex module. An empty include
+// list takes every path. A path that an ignore pattern or an ignore
+// regexp takes is out, whatever the include list says. A regexp
+// matches when it matches anywhere in the path, because the regex
+// module has no anchors.
 struct Filter {
     include: const u8[:],
     ignore: const u8[:],
+    ignore_regexp: const u8[:] = "",
 }
 
 // start starts a watcher on the path. The flag asks for the
@@ -167,8 +181,31 @@ fn any_match(list: const u8[:], path: const u8[:]) -> bool {
     return false;
 }
 
+// re_match tells whether one regexp of the list fits the path. A
+// regexp matches when it matches anywhere in the path. A pattern that
+// the regex module refuses is skipped, so a bad pattern never matches
+// and never makes the wait slow.
+fn re_match(list: const u8[:], path: const u8[:]) -> bool {
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while i <= list.len {
+        if i == list.len || list[i] == ';' {
+            let pat = list[start..i];
+            if pat.len > 0 {
+                var err: u8[>..] = [];
+                let re = regex::compile(pat, err);
+                if err.len == 0 && regex::matches(re, path) { return true; }
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    return false;
+}
+
 // allowed tells whether the filter lets the path through.
 fn allowed(f: Filter, path: const u8[:]) -> bool {
+    if f.ignore_regexp.len > 0 && re_match(f.ignore_regexp, path) { return false; }
     if f.ignore.len > 0 && any_match(f.ignore, path) { return false; }
     if f.include.len > 0 { return any_match(f.include, path); }
     return true;
@@ -216,6 +253,64 @@ fn set_poll_interval(handle: i32, ms: i32) -> bool {
 fn set_follow_symlinks(handle: i32, follow: bool) -> bool {
     if handle <= 0 { return false; }
     return watch_set(handle, SET_FOLLOW, if follow { 1 } else { 0 });
+}
+
+// set_compare_contents turns the comparison of the content of a file
+// on and off. With true, the comparison watcher folds a hash over the
+// bytes of every file at every look, so a write that keeps the size
+// and the time of the file still gives a modified event. The flag is
+// off by default, as in Rust notify. A look with the flag on reads
+// every file of the tree, so the caller pays with time. The inotify
+// watcher needs no hash, so the flag has no effect on it. The change
+// takes effect at once. It gives false for a closed watcher.
+fn set_compare_contents(handle: i32, on: bool) -> bool {
+    if handle <= 0 { return false; }
+    return watch_set(handle, SET_COMPARE_CONTENTS, if on { 1 } else { 0 });
+}
+
+// set_depth sets how many levels of subdirectories the watcher
+// watches. The root directory is level 0. A depth of -1 watches every
+// level, and is the default. A depth of 0 watches the root only. A
+// depth of n watches the root and n levels below it, as the depth
+// option of Node chokidar does. A change takes effect at once, and
+// the comparison watcher takes a new look at the trees. It gives
+// false for a closed watcher or a value below -1.
+fn set_depth(handle: i32, depth: i32) -> bool {
+    if handle <= 0 { return false; }
+    return watch_set(handle, SET_DEPTH, depth);
+}
+
+// set_base_dir sets the base of the paths of the events. A path that
+// is the base or under it goes out without the base. An empty base,
+// the default, gives the full paths, as Node chokidar gives the paths
+// relative to its cwd. A change takes effect at once. It gives false
+// for a closed watcher or a base that is too long.
+fn set_base_dir(handle: i32, dir: const u8[:]) -> bool {
+    if handle <= 0 { return false; }
+    return watch_set_path(handle, SET_BASE, dir);
+}
+
+// add_path adds a directory as a root of a live watcher. The events
+// of the new tree come like the events of the tree of start: the
+// comparison watcher takes the entries of the new tree in with no
+// events, and the inotify watcher gives a created event for each
+// entry. It gives false for a missing path, a path that is already a
+// root, or a closed watcher.
+fn add_path(handle: i32, dir: const u8[:]) -> bool {
+    if handle <= 0 { return false; }
+    return watch_add_path(dir, handle);
+}
+
+// remove_path takes a root out of a live watcher. The entries of the
+// tree give no event after the call, as the Remove call of Go fsnotify
+// and the unwatch call of Node chokidar give no event. The path must
+// be the exact text of the root. The last root stays, because a
+// watcher without a root watches nothing. It gives false when the
+// path is not a root, when it is the last root, or the watcher is
+// closed.
+fn remove_path(handle: i32, dir: const u8[:]) -> bool {
+    if handle <= 0 { return false; }
+    return watch_remove_path(dir, handle);
 }
 
 // next_batch waits for a first change, then keeps reading until no

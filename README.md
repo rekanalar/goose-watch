@@ -21,7 +21,7 @@ every system.
 Add these two lines to the root file of the program that uses it:
 
 ```goose
-import watch from "rekanalar/goose-watch@v1.0.1";
+import watch from "rekanalar/goose-watch@v1.1.0";
 import glob from "rekanalar/goose-glob@v1.2.0";
 ```
 
@@ -44,6 +44,11 @@ and v2026.3 on each.
 | `next_batch(handle, timeout_ms, quiet_ms, filter, store, events)` | wait for a burst, and merge it into one event for each path |
 | `set_poll_interval(handle, ms)` | set the pause of the comparison watcher, 1 to 60000 ms |
 | `set_follow_symlinks(handle, follow)` | go into linked directories, or not |
+| `set_compare_contents(handle, on)` | compare the content of a file, or not |
+| `set_depth(handle, depth)` | set the number of the levels of subdirectories to watch |
+| `set_base_dir(handle, dir)` | set the base of the paths of the events |
+| `add_path(handle, dir)` | add a root to a live watcher |
+| `remove_path(handle, dir)` | take a root out of a live watcher |
 | `stop(handle)` | end the watcher |
 | `group_add(group, path, deep)` | start a watcher and put it in the group |
 | `group_next(group, timeout_ms, which, out_path, out_old)` | the next event of any watcher of the group |
@@ -86,8 +91,8 @@ Before v0.2.0, the path of a rename was the old path.
 
 ### Filter
 
-A filter has two lists, `include` and `ignore`. A list is a text of
-patterns with a semicolon between them.
+A filter has three lists, `include`, `ignore` and `ignore_regexp`. A list
+is a text of patterns with a semicolon between them.
 
 The pattern is a glob pattern of the package `goose-glob`. The syntax is
 that syntax:
@@ -109,10 +114,74 @@ slash fits the whole path.
 An empty `include` takes every path. An `ignore` pattern wins over
 `include`.
 
+The `ignore_regexp` list holds regular expressions. The syntax is the
+syntax of the `regex` module of the standard library. A regular
+expression fits a path when it matches anywhere in the path, because
+that module has no anchors. A pattern that the module refuses matches
+nothing, so a bad pattern never stops the watcher. The module builds
+its tables before the first search, so a search costs one step per
+byte of the path. No pattern can make the search slow.
+
 Before v0.3.0, the filter had its own matcher. That matcher had no
 `**` and no class of characters. A star crossed a separator, so the
 pattern `src/*.c` fitted the path `src/x/y.c`. It does not fit now.
 Write `src/**/*.c` for that path.
+
+### The compare of the content
+
+`set_compare_contents(handle, true)` makes the comparison watcher read
+the content of every file at every look. Then a write that keeps the
+size and the time of the file gives a `KIND_MODIFIED` event. The flag
+is off by default, as the option of `notify` is off by default.
+
+The flag has no effect on the inotify watcher. That watcher sees every
+write at once.
+
+A look with the flag on reads every file of the tree, so a big tree
+costs time. The hash of the content has 64 bits, so a rare change can
+hide behind a collision. Only a regular file gets a hash. A pipe or a
+device is never read, so it cannot stop the watcher.
+
+### The depth
+
+`set_depth(handle, depth)` sets the number of the levels of
+subdirectories that the watcher watches. The root directory is level 0.
+A depth of -1 watches every level, and is the default. A depth of 0
+watches the root only. A depth of n watches the root and n levels below
+it, as the `depth` option of `chokidar` does.
+
+A change takes effect at once. The comparison watcher takes a new look
+at the trees. A value below -1 is refused.
+
+### The roots of a live watcher
+
+`add_path(handle, dir)` adds a directory as a root of a live watcher.
+The events of the new tree come like the events of the tree of
+`start`. The comparison watcher takes the entries of the new tree in
+with no events. The inotify watcher gives a created event for each
+entry.
+
+`remove_path(handle, dir)` takes a root out. The entries of the tree
+give no event after the call. The `Remove` call of `fsnotify` gives no
+event either. The `unwatch` call of `chokidar` gives no event. Give
+the path as the exact text of the root.
+
+Both calls fail for a path that is not a directory. They fail too for a
+path that is already a root, and for a closed watcher. The removal of
+the last root fails too, because a watcher without a root watches
+nothing.
+
+Keep the roots apart. A root under another root shares its entries.
+The removal of the outer root keeps the inner one working.
+
+### The base of the paths
+
+`set_base_dir(handle, dir)` makes the paths of the events relative to
+the base. A path that is the base or under it goes out without the
+base. An empty base, the default, gives the full paths, as `chokidar`
+gives the paths relative to its `cwd`.
+
+A change takes effect at once. The old path of a rename is short too.
 
 ### Burst merge
 
@@ -134,7 +203,7 @@ The paths go on the `store` buffer, which must outlive the events.
 
 ```goose
 import std;
-import watch from "rekanalar/goose-watch@v1.0.1";
+import watch from "rekanalar/goose-watch@v1.1.0";
 import glob from "rekanalar/goose-glob@v1.2.0";
 
 fn main() {
@@ -176,18 +245,27 @@ no link to follow.
 
 A change that starts and ends between two looks may be missed on those
 systems. A file that changes and keeps its time and its size may look
-unchanged on those systems. The comparison watcher finds a rename by
-the inode. A file that is copied while the original is removed looks
-like a removal and a new file.
+unchanged on those systems. The caller turns the compare of the
+content on to see it. The comparison watcher finds a rename by the
+inode. A file that is copied while the original is removed looks like
+a removal and a new file.
 
 The burst merge keeps one event for each path, so it cannot show how
 many times a file changed.
+
+Two options of `chokidar` stay out. The option `ignoreInitial` tells
+the watcher to give no event for the entries of a tree that it sees
+first. `notify`, `fsnotify` and `watchdog` have no such option. The
+package gives the entries of a new subtree as created events. The
+option `alwaysStat` tells the watcher to give the stat of a path with
+every event. `fsnotify` and `watchdog` give no stat with an event, and
+the package gives none.
 
 ## The disagreements with the other languages
 
 The rule of the project is hard. A gap stays in one case. The mature
 libraries of Python, Node, Rust and Go disagree on the behavior, and no
-standard decides it. Four such gaps stay:
+standard decides it. Three such gaps stay:
 
 - **Open and close of a file.** `watchdog` gives `FileOpenedEvent` and
   `FileClosedEvent` on Linux. `notify` gives access events on Linux
@@ -200,9 +278,6 @@ standard decides it. Four such gaps stay:
   event per write. A poll backend gives one per look. `fsnotify` does
   not merge. `chokidar` merges with `awaitWriteFinish`. The package
   merges in `next_batch`, and the caller picks the merge.
-- **The content compare for a file with the same size and time.**
-  `notify` has an option for it. The others have none. The package does
-  not compare content.
 
 ## Changes that break old code
 

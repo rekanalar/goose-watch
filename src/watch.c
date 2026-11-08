@@ -93,13 +93,16 @@ typedef struct {
     char path[MAX_PATH];
 } wd_entry;
 
-// One entry of the tree, for the comparison watcher.
+// One entry of the tree, for the comparison watcher. The hash holds
+// the FNV-1a 64 of the content when the flag of the watcher asks for
+// it, and 0 for a directory or when the flag is off.
 typedef struct {
     char path[MAX_PATH];
     long long mtime;
     long long size;
     long long ino;
     unsigned int mode;
+    unsigned long long hash;
     int is_dir;
 } file_entry;
 
@@ -112,7 +115,19 @@ typedef struct {
     int follow;
     // The pause between two looks of the comparison watcher, in ms.
     int interval;
-    char root[MAX_PATH];
+    // The deepest watched level. The root is level 0. A value of -1
+    // watches every level.
+    int max_depth;
+    // 1 folds a content hash into every look of the comparison
+    // watcher.
+    int compare;
+    // The base of the event paths. Empty gives the full paths.
+    char base[MAX_PATH];
+    // The roots of the watcher. The first root is the directory of
+    // the open call; the others came through watch_add_path.
+    char (*roots)[MAX_PATH];
+    int nroots;
+    int roots_cap;
     int fd;
     // The events of the inotify watcher that wait in the buffer.
     uint8_t *pending;
@@ -167,6 +182,37 @@ static void path_join(char *out, int64_t out_cap, const char *dir,
     } else {
         snprintf(out, (size_t)out_cap, "%s/%s", dir, name);
     }
+}
+
+// root0 gives the first root, the one of the open call.
+static const char *root0(watcher_t *w) {
+    return w->nroots > 0 ? w->roots[0] : "";
+}
+
+// depth_allows tells whether a directory of the level is watched. The
+// root is level 0.
+static int depth_allows(int max_depth, int level) {
+    if (max_depth < 0) return 1;
+    return level <= max_depth;
+}
+
+// shorten puts the path of an event in the buffer. When the watcher
+// has a base and the path is the base or under it, the part after the
+// base goes out. Any other path goes out in full.
+static void shorten(const watcher_t *w, const char *path, char *out,
+                    int64_t cap) {
+    size_t n = strlen(w->base);
+    if (n > 0 && strncmp(path, w->base, n) == 0) {
+        if (path[n] == '/') {
+            snprintf(out, (size_t)cap, "%s", path + n + 1);
+            return;
+        }
+        if (path[n] == 0) {
+            snprintf(out, (size_t)cap, ".");
+            return;
+        }
+    }
+    snprintf(out, (size_t)cap, "%s", path);
 }
 
 static int is_dir(const char *path);
@@ -235,6 +281,57 @@ static long long dir_identity(const char *path) {
 // The comparison watcher. It walks the tree and keeps the time, the
 // size, the mode and the rule of a directory of every entry.
 
+// content_hash folds FNV-1a 64 over the bytes of a file. It gives 0
+// when the file cannot be read. A directory never gets a hash. Only a
+// regular file gets one, so a named pipe never stops the watcher. The
+// file is opened without a wait, so a pipe that appears between the
+// look and the open cannot stop it either.
+static unsigned long long content_hash(const char *path) {
+    unsigned long long h = 1469598103934665603ULL;
+#ifdef _WIN32
+    wchar_t wide[MAX_PATH];
+    if (!win_wide(path, wide, MAX_PATH)) return 0;
+    HANDLE h2 = CreateFileW(wide, GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h2 == INVALID_HANDLE_VALUE) return 0;
+    // Only a file of the disk has bytes to read. A pipe has none.
+    if (GetFileType(h2) != FILE_TYPE_DISK) {
+        CloseHandle(h2);
+        return 0;
+    }
+    uint8_t buf[65536];
+    DWORD got = 0;
+    while (ReadFile(h2, buf, (DWORD)sizeof(buf), &got, NULL) && got > 0) {
+        for (DWORD i = 0; i < got; i++) {
+            h ^= (unsigned long long)buf[i];
+            h *= 1099511628211ULL;
+        }
+    }
+    CloseHandle(h2);
+    return h;
+#else
+    // The open without a wait keeps a pipe from holding the watcher.
+    int fd = open(path, O_RDONLY | O_NONBLOCK);
+    if (fd < 0) return 0;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return 0;
+    }
+    uint8_t buf[65536];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        for (ssize_t i = 0; i < n; i++) {
+            h ^= (unsigned long long)buf[i];
+            h *= 1099511628211ULL;
+        }
+    }
+    close(fd);
+    return h;
+#endif
+}
+
 // cmp_entries puts the new list of entries next to the old list and
 // queues one event for each change.
 static void cmp_entries(watcher_t *w, file_entry *fresh, int nfresh) {
@@ -295,6 +392,15 @@ next_fresh: ;
             if (strcmp(fresh[i].path, w->files[j].path) != 0) continue;
             if (fresh[i].mtime == w->files[j].mtime &&
                 fresh[i].size == w->files[j].size) {
+                // The metadata is the same. When the flag asks for
+                // the content, a hash that differs is a write that
+                // keeps the size and the time.
+                if (w->compare && fresh[i].hash != w->files[j].hash) {
+                    w->files[j].hash = fresh[i].hash;
+                    queue_push(w, EV_MODIFIED | (fresh[i].is_dir ? EV_ISDIR : 0),
+                               fresh[i].path, NULL);
+                    break;
+                }
                 if (fresh[i].mode != w->files[j].mode) {
                     w->files[j].mode = fresh[i].mode;
                     queue_push(w, EV_ATTRIB | (fresh[i].is_dir ? EV_ISDIR : 0),
@@ -358,10 +464,11 @@ static int win_stat(const char *path, int follow, BY_HANDLE_FILE_INFORMATION *in
 // The count of the directories stops the walk only as a guard against
 // a tree that grows while the walk runs. A loop of links is cut by the
 // number of the directory.
-static int win_walk(const char *dir, int recursive, int follow, int depth,
-                    long long *seen, int nseen, int *ndirs,
-                    file_entry *fresh, int cap, int n) {
+static int win_walk(const char *dir, int recursive, int follow, int compare,
+                    int max_depth, int depth, long long *seen, int nseen,
+                    int *ndirs, file_entry *fresh, int cap, int n) {
     if (*ndirs >= 4096 || depth >= MAX_DEPTH) return n;
+    if (!depth_allows(max_depth, depth)) return n;
     *ndirs += 1;
     long long id = dir_identity(dir);
     for (int i = 0; i < nseen; i++) {
@@ -405,24 +512,41 @@ static int win_walk(const char *dir, int recursive, int follow, int depth,
             fresh[n].ino = ((long long)info.nFileIndexHigh << 32) |
                            (long long)info.nFileIndexLow;
             fresh[n].mode = mode;
+            fresh[n].hash = (ok && !entry_isdir && !islink && compare)
+                            ? content_hash(full) : 0;
             fresh[n].is_dir = entry_isdir;
             n += 1;
         }
         if (ok && entry_isdir && recursive) {
-            n = win_walk(full, recursive, follow, depth + 1, seen, nseen,
-                         ndirs, fresh, cap, n);
+            n = win_walk(full, recursive, follow, compare, max_depth,
+                         depth + 1, seen, nseen, ndirs, fresh, cap, n);
         }
     } while (FindNextFileW(h, &found));
     FindClose(h);
     return n;
 }
 
-// scan_files puts the entries of the tree of the watcher into the list.
-static int scan_files(watcher_t *w, file_entry *fresh, int cap) {
+// scan_one puts the entries of the tree of one root into the list.
+static int scan_one(watcher_t *w, const char *root, file_entry *fresh,
+                    int cap) {
     int ndirs = 0;
     long long seen[MAX_DEPTH];
-    return win_walk(w->root, w->recursive, w->follow, 0, seen, 0, &ndirs,
-                    fresh, cap, 0);
+    return win_walk(root, w->recursive, w->follow, w->compare, w->max_depth,
+                    0, seen, 0, &ndirs, fresh, cap, 0);
+}
+
+// scan_files puts the entries of the tree of every root into the
+// list. The count runs over the roots, so each root writes behind the
+// entries of the one before it.
+static int scan_files(watcher_t *w, file_entry *fresh, int cap) {
+    int n = 0;
+    for (int r = 0; r < w->nroots; r++) {
+        int ndirs = 0;
+        long long seen[MAX_DEPTH];
+        n = win_walk(w->roots[r], w->recursive, w->follow, w->compare,
+                     w->max_depth, 0, seen, 0, &ndirs, fresh, cap, n);
+    }
+    return n;
 }
 
 #else
@@ -439,22 +563,22 @@ static int scan_files(watcher_t *w, file_entry *fresh, int cap) {
      (long long)(st).st_mtim.tv_nsec)
 #endif
 
-// scan_files puts the entries of the tree of the watcher into the
-// list. A directory is an entry too. A loop of links is cut by the
-// number of the directory.
-static int scan_files(watcher_t *w, file_entry *fresh, int cap) {
-    int nfresh = 0;
-    // The stack of the walk. Each step holds the directory, the stack
-    // place of its parent and the identities of the directories on the
-    // path from the root. An identity that appears twice is a loop of
-    // links, and the walk does not go into it again.
+// walk_root puts the entries of the tree of one root into the list. A
+// directory is an entry too. A loop of links is cut by the number of
+// the directory. The stack holds the directories, the level of each
+// one, and the identities of the directories on the path from the
+// root. An identity that appears twice is a loop of links, and the
+// walk does not go into it again. A directory below the depth rule is
+// not entered, so its entries never come out.
+static int walk_root(watcher_t *w, const char *root, file_entry *fresh,
+                     int cap, int n, int *ndirs) {
     char stack[MAX_DEPTH][MAX_PATH];
-    int parent[MAX_DEPTH];
+    int level[MAX_DEPTH];
     long long seen[MAX_DEPTH][MAX_DEPTH];
     int nseen[MAX_DEPTH];
     int top = 0;
-    snprintf(stack[0], MAX_PATH, "%s", w->root);
-    parent[0] = -1;
+    snprintf(stack[0], MAX_PATH, "%s", root);
+    level[0] = 0;
     nseen[0] = 0;
     while (top >= 0) {
         char dir[MAX_PATH];
@@ -467,6 +591,12 @@ static int scan_files(watcher_t *w, file_entry *fresh, int cap) {
             if (seen[here][i] == id && id != 0) { loop = 1; break; }
         }
         if (loop) continue;
+        // The count of the directories stops the walk only as a guard
+        // against a tree that grows while the walk runs, and against a
+        // tree of links that has no loop. The Windows walk has the
+        // same guard.
+        if (*ndirs >= 4096) break;
+        *ndirs += 1;
         DIR *d = opendir(dir);
         if (!d) continue;
         struct dirent *e;
@@ -477,19 +607,22 @@ static int scan_files(watcher_t *w, file_entry *fresh, int cap) {
             struct stat st;
             if ((w->follow ? stat(full, &st) : lstat(full, &st)) != 0) continue;
             int isdir = S_ISDIR(st.st_mode);
-            if (nfresh < cap) {
-                snprintf(fresh[nfresh].path, MAX_PATH, "%s", full);
-                fresh[nfresh].mtime = ST_MTIME_NS(st);
-                fresh[nfresh].size = (long long)st.st_size;
-                fresh[nfresh].ino = (long long)st.st_ino;
-                fresh[nfresh].mode = (unsigned int)st.st_mode;
-                fresh[nfresh].is_dir = isdir;
-                nfresh += 1;
+            if (n < cap) {
+                snprintf(fresh[n].path, MAX_PATH, "%s", full);
+                fresh[n].mtime = ST_MTIME_NS(st);
+                fresh[n].size = (long long)st.st_size;
+                fresh[n].ino = (long long)st.st_ino;
+                fresh[n].mode = (unsigned int)st.st_mode;
+                fresh[n].hash = (!isdir && w->compare && S_ISREG(st.st_mode))
+                                ? content_hash(full) : 0;
+                fresh[n].is_dir = isdir;
+                n += 1;
             }
-            if (isdir && w->recursive && top + 1 < MAX_DEPTH) {
+            if (isdir && w->recursive && top + 1 < MAX_DEPTH &&
+                depth_allows(w->max_depth, level[here] + 1)) {
                 top += 1;
                 snprintf(stack[top], MAX_PATH, "%s", full);
-                parent[top] = here;
+                level[top] = level[here] + 1;
                 int carry = nseen[here];
                 if (carry > MAX_DEPTH - 1) carry = MAX_DEPTH - 1;
                 memcpy(seen[top], seen[here], (size_t)carry * sizeof(long long));
@@ -503,12 +636,32 @@ static int scan_files(watcher_t *w, file_entry *fresh, int cap) {
         }
         closedir(d);
     }
-    return nfresh;
+    return n;
+}
+
+// scan_one puts the entries of the tree of one root into the list.
+static int scan_one(watcher_t *w, const char *root, file_entry *fresh,
+                    int cap) {
+    int ndirs = 0;
+    return walk_root(w, root, fresh, cap, 0, &ndirs);
+}
+
+// scan_files puts the entries of the tree of every root into the
+// list. The count runs over the roots, so each root writes behind the
+// entries of the one before it.
+static int scan_files(watcher_t *w, file_entry *fresh, int cap) {
+    int n = 0;
+    int ndirs = 0;
+    for (int r = 0; r < w->nroots; r++) {
+        n = walk_root(w, w->roots[r], fresh, cap, n, &ndirs);
+    }
+    return n;
 }
 
 #endif
 
-// prime fills the list of the entries with the entries of the tree now.
+// prime fills the list of the entries with the entries of the trees
+// now.
 static int prime(watcher_t *w) {
     int cap = 256;
     file_entry *fresh = (file_entry *)malloc((size_t)cap * sizeof(file_entry));
@@ -522,9 +675,35 @@ static int prime(watcher_t *w) {
         cap = nc;
         n = scan_files(w, fresh, cap);
     }
+    free(w->files);
     w->files = fresh;
     w->files_cap = cap;
     w->nfiles = n;
+    return 1;
+}
+
+// prime_root takes the entries of one root into the table with no
+// events. The caller has just added the root, so its entries are new
+// for the watcher, but they are its start state, not changes.
+static int prime_root(watcher_t *w, const char *dir) {
+    int cap = 256;
+    file_entry *fresh = (file_entry *)malloc((size_t)cap * sizeof(file_entry));
+    if (!fresh) return 0;
+    int n = scan_one(w, dir, fresh, cap);
+    while (n >= cap) {
+        int nc = cap * 2;
+        file_entry *q = (file_entry *)realloc(fresh, (size_t)nc * sizeof(file_entry));
+        if (!q) break;
+        fresh = q;
+        cap = nc;
+        n = scan_one(w, dir, fresh, cap);
+    }
+    for (int i = 0; i < n; i++) {
+        if (w->nfiles >= w->files_cap &&
+            !grow((void **)&w->files, &w->files_cap, sizeof(file_entry))) break;
+        memcpy(&w->files[w->nfiles++], &fresh[i], sizeof(file_entry));
+    }
+    free(fresh);
     return 1;
 }
 
@@ -583,13 +762,42 @@ static void drop_watch(watcher_t *w, int wd) {
     }
 }
 
-// The path of a watch descriptor. It gives the root when the number is
-// not in the table.
+// The path of a watch descriptor. It gives the first root when the
+// number is not in the table.
 static const char *wd_path(watcher_t *w, int wd) {
     for (int i = 0; i < w->nwds; i++) {
         if (w->wds[i].wd == wd) return w->wds[i].path;
     }
-    return w->root;
+    return root0(w);
+}
+
+// path_level gives the level of a path below the first root. The
+// first root itself is level 0. A path that is not under the first
+// root is level 0.
+static int path_level(watcher_t *w, const char *path) {
+    const char *r = root0(w);
+    size_t n = strlen(r);
+    if (strncmp(path, r, n) != 0) return 0;
+    int level = 0;
+    for (const char *p = path + n; *p; p++) {
+        if (*p == '/') level += 1;
+    }
+    return level;
+}
+
+// drop_below_depth removes the watch of every directory that the
+// depth rule no longer allows.
+static void drop_below_depth(watcher_t *w) {
+    for (int i = 0; i < w->nwds; ) {
+        if (!depth_allows(w->max_depth, path_level(w, w->wds[i].path))) {
+            inotify_rm_watch(w->fd, w->wds[i].wd);
+            memmove(&w->wds[i], &w->wds[i + 1],
+                    (size_t)(w->nwds - i - 1) * sizeof(wd_entry));
+            w->nwds -= 1;
+        } else {
+            i += 1;
+        }
+    }
 }
 
 // watch_subtree puts a watch on the directory and, when the watcher is
@@ -598,7 +806,7 @@ static const char *wd_path(watcher_t *w, int wd) {
 static void watch_subtree(watcher_t *w, const char *dir, int depth);
 
 static void watch_subtree(watcher_t *w, const char *dir, int depth) {
-    if (depth >= MAX_DEPTH) return;
+    if (depth >= MAX_DEPTH || !depth_allows(w->max_depth, depth)) return;
     add_watch(w, dir);
     DIR *d = opendir(dir);
     if (!d) return;
@@ -795,19 +1003,30 @@ int watch_open(watch_slice path, int recursive, int32_t *handle_out) {
     w->recursive = recursive ? 1 : 0;
     w->follow = 0;
     w->interval = DEFAULT_INTERVAL_MS;
-    snprintf(w->root, MAX_PATH, "%s", dir);
+    w->max_depth = -1;
+    w->compare = 0;
+    w->roots = (char (*)[MAX_PATH])malloc(4 * MAX_PATH);
+    if (!w->roots) { w->used = 0; return 0; }
+    w->roots_cap = 4;
+    w->nroots = 1;
+    snprintf(w->roots[0], MAX_PATH, "%s", dir);
     if (watch_use_inotify()) {
 #if WATCH_HAS_INOTIFY
         w->fd = inotify_init1(IN_NONBLOCK);
-        if (w->fd < 0) { w->used = 0; return 0; }
+        if (w->fd < 0) { free(w->roots); w->used = 0; return 0; }
         w->pending_cap = 65536;
         w->pending = (uint8_t *)malloc((size_t)w->pending_cap);
-        if (!w->pending) { close(w->fd); w->used = 0; return 0; }
+        if (!w->pending) {
+            close(w->fd);
+            free(w->roots);
+            w->used = 0;
+            return 0;
+        }
         // The watch of the root and, when the watcher is deep, of
         // each directory of the tree. The subtree scan queues the
         // entries that came before their watch; a shallow watcher
         // keeps only the watch of the root.
-        watch_subtree(w, w->root, 0);
+        watch_subtree(w, root0(w), 0);
         w->nqueue = 0;
 #endif
     } else {
@@ -829,6 +1048,7 @@ int watch_close(int32_t handle) {
     free(w->queue);
     free(w->wds);
     free(w->files);
+    free(w->roots);
     memset(w, 0, sizeof(*w));
     return 1;
 }
@@ -849,7 +1069,9 @@ int watch_next(int32_t handle, int32_t timeout_ms, gs_rref out_path) {
             queued *q = &w->queue[0];
             int kind = q->kind;
             snprintf(w->old, MAX_PATH, "%s", q->old);
-            gs_bld_append(out_path, q->path, (int64_t)strlen(q->path));
+            char shown[MAX_PATH];
+            shorten(w, q->path, shown, MAX_PATH);
+            gs_bld_append(out_path, shown, (int64_t)strlen(shown));
             memmove(&w->queue[0], &w->queue[1],
                     (size_t)(w->nqueue - 1) * sizeof(queued));
             w->nqueue -= 1;
@@ -891,13 +1113,17 @@ int watch_old(int32_t handle, gs_rref out_path) {
     if (handle <= 0 || handle > MAX_WATCHERS) return 0;
     watcher_t *w = &g_watchers[handle - 1];
     if (!w->used || w->old[0] == 0) return 0;
-    gs_bld_append(out_path, w->old, (int64_t)strlen(w->old));
+    char shown[MAX_PATH];
+    shorten(w, w->old, shown, MAX_PATH);
+    gs_bld_append(out_path, shown, (int64_t)strlen(shown));
     return 1;
 }
 
 // The keys of watch_set.
 #define SET_INTERVAL 1
 #define SET_FOLLOW 2
+#define SET_COMPARE_CONTENTS 3
+#define SET_DEPTH 4
 
 // watch_set changes one setting of an open watcher. The call has three
 // slots, so the C API stays narrow for every new setting. It gives 1 on
@@ -921,7 +1147,36 @@ int watch_set(int32_t handle, int32_t key, int32_t value) {
         // of the first look are not given to the caller.
         if (watch_use_inotify()) {
 #if WATCH_HAS_INOTIFY
-            watch_subtree(w, w->root, 0);
+            watch_subtree(w, root0(w), 0);
+            prime(w);
+            w->nqueue = 0;
+#endif
+        } else {
+            prime(w);
+        }
+        return 1;
+    }
+    if (key == SET_COMPARE_CONTENTS) {
+        int on = value ? 1 : 0;
+        if (on == w->compare) return 1;
+        w->compare = on;
+        // The stored hashes belong to the old flag, so the list of
+        // the entries is made again. The events of the new look are
+        // not given to the caller.
+        if (!watch_use_inotify()) prime(w);
+        w->nqueue = 0;
+        return 1;
+    }
+    if (key == SET_DEPTH) {
+        if (value < -1) return 0;
+        if (value == w->max_depth) return 1;
+        w->max_depth = (int)value;
+        if (watch_use_inotify()) {
+#if WATCH_HAS_INOTIFY
+            // The watches below the new level go, the watches that
+            // the rule now allows come.
+            drop_below_depth(w);
+            watch_subtree(w, root0(w), 0);
             prime(w);
             w->nqueue = 0;
 #endif
@@ -931,6 +1186,191 @@ int watch_set(int32_t handle, int32_t key, int32_t value) {
         return 1;
     }
     return 0;
+}
+
+// The keys of watch_set_path.
+#define SET_BASE 5
+
+// watch_set_path stores one path setting of an open watcher. It
+// serves the base of the event paths. A trailing slash of the base
+// goes, so the base matches in both spellings. An empty path clears
+// the base. It gives 1 on success.
+int watch_set_path(int32_t handle, int32_t key, watch_slice path) {
+    if (handle <= 0 || handle > MAX_WATCHERS) return 0;
+    watcher_t *w = &g_watchers[handle - 1];
+    if (!w->used) return 0;
+    if (key != SET_BASE) return 0;
+    char buf[MAX_PATH];
+    int64_t len = path.len;
+    if (len < 0 || len >= (int64_t)sizeof(buf)) return 0;
+    if (len > 0) memcpy(buf, path.data, (size_t)len);
+    buf[len] = 0;
+    while (len > 1 && buf[len - 1] == '/') {
+        buf[len - 1] = 0;
+        len -= 1;
+    }
+    snprintf(w->base, MAX_PATH, "%s", buf);
+    return 1;
+}
+
+// watch_add_path adds a root to a live watcher. The comparison
+// watcher takes the entries of the new tree in with no events. The
+// inotify watcher sets the watches of the new tree and queues a
+// created event for each entry, as the open call does. It gives 0
+// when the path is not a directory, is already a root, or the
+// watcher is closed.
+int watch_add_path(watch_slice dir, int32_t handle) {
+    if (handle <= 0 || handle > MAX_WATCHERS) return 0;
+    watcher_t *w = &g_watchers[handle - 1];
+    if (!w->used) return 0;
+    char buf[MAX_PATH];
+    int64_t len = dir.len;
+    if (len <= 0 || len >= (int64_t)sizeof(buf)) return 0;
+    memcpy(buf, dir.data, (size_t)len);
+    buf[len] = 0;
+    if (!is_dir(buf)) return 0;
+    for (int i = 0; i < w->nroots; i++) {
+        if (strcmp(w->roots[i], buf) == 0) return 0;
+    }
+    if (w->nroots >= w->roots_cap &&
+        !grow((void **)&w->roots, &w->roots_cap, MAX_PATH)) return 0;
+    snprintf(w->roots[w->nroots++], MAX_PATH, "%s", buf);
+    if (watch_use_inotify()) {
+#if WATCH_HAS_INOTIFY
+        watch_subtree(w, buf, 0);
+#endif
+    } else {
+        prime_root(w, buf);
+    }
+    return 1;
+}
+
+// watch_remove_path takes a root out of a live watcher. The entries
+// of the root go with no events, as the unwatch calls of the
+// references give no event. It gives 0 when the path is not a root or
+// the watcher is closed. The path must be the exact text of the root.
+// The last root of a watcher stays, because a watcher without a root
+// watches nothing.
+int watch_remove_path(watch_slice dir, int32_t handle) {
+    if (handle <= 0 || handle > MAX_WATCHERS) return 0;
+    watcher_t *w = &g_watchers[handle - 1];
+    if (!w->used) return 0;
+    char buf[MAX_PATH];
+    int64_t len = dir.len;
+    if (len <= 0 || len >= (int64_t)sizeof(buf)) return 0;
+    memcpy(buf, dir.data, (size_t)len);
+    buf[len] = 0;
+    int at = -1;
+    for (int i = 0; i < w->nroots; i++) {
+        if (strcmp(w->roots[i], buf) == 0) { at = i; break; }
+    }
+    if (at < 0 || w->nroots < 2) return 0;
+#if WATCH_HAS_INOTIFY
+    if (watch_use_inotify()) {
+        // The watches of the tree go first, so their later events
+        // find no table entry.
+        size_t n = strlen(buf);
+        for (int i = 0; i < w->nwds; ) {
+            if (strcmp(w->wds[i].path, buf) == 0 ||
+                (strncmp(w->wds[i].path, buf, n) == 0 &&
+                 w->wds[i].path[n] == '/')) {
+                inotify_rm_watch(w->fd, w->wds[i].wd);
+                memmove(&w->wds[i], &w->wds[i + 1],
+                        (size_t)(w->nwds - i - 1) * sizeof(wd_entry));
+                w->nwds -= 1;
+            } else {
+                i += 1;
+            }
+        }
+    }
+#endif
+    // The entries of the tree go with no events.
+    size_t n2 = strlen(buf);
+    for (int j = 0; j < w->nfiles; ) {
+        if (strcmp(w->files[j].path, buf) == 0 ||
+            (strncmp(w->files[j].path, buf, n2) == 0 &&
+             w->files[j].path[n2] == '/')) {
+            memmove(&w->files[j], &w->files[j + 1],
+                    (size_t)(w->nfiles - j - 1) * sizeof(file_entry));
+            w->nfiles -= 1;
+        } else {
+            j += 1;
+        }
+    }
+    for (int i = at; i + 1 < w->nroots; i++) {
+        memcpy(w->roots[i], w->roots[i + 1], MAX_PATH);
+    }
+    w->nroots -= 1;
+    // A root that lies under the removed one keeps its own watches and
+    // its own entries. The look of the other root finds them again, so
+    // the entries go back in the table with no event.
+    int saved = w->nqueue;
+    for (int i = 0; i < w->nroots; i++) {
+        if (strncmp(w->roots[i], buf, n2) != 0 || w->roots[i][n2] != '/') continue;
+#if WATCH_HAS_INOTIFY
+        if (watch_use_inotify()) {
+            watch_subtree(w, w->roots[i], 0);
+        } else {
+            prime_root(w, w->roots[i]);
+        }
+#else
+        prime_root(w, w->roots[i]);
+#endif
+    }
+    // The events of the roots that came back are not given to the
+    // caller.
+    w->nqueue = saved;
+    return 1;
+}
+
+// watch_test_fifo makes a named pipe. The tests use it, because the
+// standard library has no call for it. It gives 1 when the pipe is
+// there. It gives 0 when the system has no pipes.
+int watch_test_fifo(watch_slice path) {
+#ifdef _WIN32
+    (void)path;
+    return 0;
+#else
+    char buf[MAX_PATH];
+    if (path.len <= 0 || path.len >= MAX_PATH) return 0;
+    memcpy(buf, path.data, (size_t)path.len);
+    buf[path.len] = 0;
+    return mkfifo(buf, 0644) == 0 ? 1 : 0;
+#endif
+}
+
+// watch_test_touch sets the time of the last write of a path. The
+// tests use it, because the standard library has no call for it. It
+// gives 1 when the time is set. It gives 0 on a fault.
+int watch_test_touch(watch_slice path, int64_t sec, int64_t nsec) {
+    char buf[MAX_PATH];
+    if (path.len <= 0 || path.len >= (int64_t)sizeof(buf)) return 0;
+    memcpy(buf, path.data, (size_t)path.len);
+    buf[path.len] = 0;
+#ifdef _WIN32
+    wchar_t wide[MAX_PATH];
+    if (!win_wide(buf, wide, MAX_PATH)) return 0;
+    HANDLE h = CreateFileW(wide, FILE_WRITE_ATTRIBUTES,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    // The time of Windows counts from 1601 in steps of 100 ns.
+    long long ticks = sec * 10000000LL + nsec / 100 + 116444736000000000LL;
+    LARGE_INTEGER li;
+    li.QuadPart = (LONGLONG)ticks;
+    FILETIME ft;
+    ft.dwLowDateTime = li.LowPart;
+    ft.dwHighDateTime = (DWORD)li.HighPart;
+    int ok = SetFileTime(h, NULL, NULL, &ft);
+    CloseHandle(h);
+    return ok ? 1 : 0;
+#else
+    struct timespec times[2];
+    times[0].tv_sec = (time_t)sec;
+    times[0].tv_nsec = (long)nsec;
+    times[1] = times[0];
+    return utimensat(AT_FDCWD, buf, times, 0) == 0 ? 1 : 0;
+#endif
 }
 
 // watch_test_chmod changes the mode of a path. The tests use it,
