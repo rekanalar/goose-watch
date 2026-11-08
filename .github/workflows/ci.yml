@@ -35,13 +35,14 @@ jobs:
             macOS) asset="macos-arm64.tar.gz" ;;
             Windows) asset="windows-x64.zip" ;;
           esac
+          # A busy GitHub CDN answers a release download with a 504. The retry rides it out.
           url="https://github.com/aardappel/goose/releases/download/${tag}/goose-${tag}-${asset}"
           if [ "$RUNNER_OS" = Windows ]; then
-            curl -fsSL "$url" -o "$dest/goose.zip"
+            curl -fsSL --retry 20 --retry-delay 15 --retry-max-time 600 --retry-all-errors "$url" -o "$dest/goose.zip"
             7z x -y -o"$dest" "$dest/goose.zip" > /dev/null
             exe=$(find "$dest" -type f -name goose.exe | head -1)
           else
-            curl -fsSL "$url" -o "$dest/goose.tar.gz"
+            curl -fsSL --retry 20 --retry-delay 15 --retry-max-time 600 --retry-all-errors "$url" -o "$dest/goose.tar.gz"
             tar -xzf "$dest/goose.tar.gz" -C "$dest"
             exe=$(find "$dest" -type f -name goose | head -1)
           fi
