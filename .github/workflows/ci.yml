@@ -3,6 +3,10 @@ name: ci
 on:
   push:
     branches: [main]
+    # A push that touches only the documentation runs no matrix. The
+    # matrix checks the build, and the documentation does not change it.
+    paths-ignore:
+      - '**/*.md'
   pull_request:
   workflow_dispatch:
 
